@@ -1,8 +1,34 @@
 # scrape_juliet.py
 import json
 import sys
+import os
 from playwright.sync_api import sync_playwright
 import re
+
+def get_browser_args():
+    """Get browser arguments based on environment"""
+    base_args = [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-ipc-flooding-protection'
+    ]
+    
+    # Check if running in Streamlit Cloud or similar environment
+    if os.getenv('STREAMLIT_SERVER_PORT') or os.getenv('HOSTNAME', '').startswith('streamlit'):
+        base_args.extend([
+            '--single-process',
+            '--no-zygote',
+            '--disable-extensions',
+            '--disable-plugins'
+        ])
+    
+    return base_args
 
 # -------------------------
 # Broadway Inbound show extraction
@@ -22,126 +48,152 @@ def get_broadway_shows() -> tuple:
     debug = []
     base_url = "https://www.broadwayinbound.com"
     
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor'
-            ]
-        )
-        page = browser.new_page()
-        
-        try:
-            # Navigate to the shows page
-            debug.append(f"Navigating to {base_url}/shows...")
-            print(f"Navigating to {base_url}/shows...")
-            page.goto(f"{base_url}/shows", wait_until="networkidle", timeout=30000)
+    try:
+        with sync_playwright() as pw:
+            debug.append("🎭 Initializing Playwright...")
+            print("🎭 Initializing Playwright...")
             
-            # 1) Accept terms so the AJAX show-loader can run
             try:
-                debug.append("Looking for terms modal...")
-                print("Looking for terms modal...")
-                page.wait_for_selector('text="I Understand"', timeout=10000)
-                debug.append("Found terms modal, clicking 'I Understand'...")
-                print("Found terms modal, clicking 'I Understand'...")
-                page.click('text="I Understand"')
-                debug.append("Terms modal dismissed")
-                print("Terms modal dismissed")
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=get_browser_args()
+                )
+                debug.append("✅ Browser launched successfully")
+                print("✅ Browser launched successfully")
             except Exception as e:
-                msg = f"No terms modal found or couldn't click: {e}"
-                debug.append(msg)
-                print(msg)
+                debug.append(f"❌ Browser launch failed: {e}")
+                print(f"❌ Browser launch failed: {e}")
+                return [], debug
             
-            # Wait for the page to load completely after modal dismissal
-            page.wait_for_timeout(3000)
-            
-            # Grab the page's HTML and extract the shows JSON directly
-            debug.append("Extracting shows from page HTML...")
-            print("Extracting shows from page HTML...")
-            
-            html = page.content()
-            
-            # Use a regex to pull out the `shows = [...]` JSON blob
-            import re, json
-            match = re.search(r'var shows\s*=\s*(\[\{.*?\}\]);', html, re.S)
-            if not match:
-                debug.append("Couldn't find the shows array in the page source")
-                print("Couldn't find the shows array in the page source")
-                # Try alternative patterns
-                alt_patterns = [
-                    r'shows\s*=\s*(\[\{.*?\}\])',
-                    r'showsList\s*=\s*(\[\{.*?\}\])',
-                    r'data\.shows\s*=\s*(\[\{.*?\}\])',
-                    r'"shows"\s*:\s*(\[\{.*?\}\])'
-                ]
+            try:
+                page = browser.new_page()
+                debug.append("📄 New page created")
+                print("📄 New page created")
                 
-                for pattern in alt_patterns:
-                    match = re.search(pattern, html, re.S)
-                    if match:
-                        debug.append(f"Found shows using alternative pattern: {pattern}")
-                        print(f"Found shows using alternative pattern: {pattern}")
-                        break
+                # Set longer timeout for cloud environments
+                page.set_default_timeout(60000)  # 60 seconds
+                
+                # Navigate to the shows page
+                debug.append(f"🌐 Navigating to {base_url}/shows...")
+                print(f"🌐 Navigating to {base_url}/shows...")
+                page.goto(f"{base_url}/shows", wait_until="networkidle", timeout=60000)
+                debug.append("✅ Page loaded successfully")
+                print("✅ Page loaded successfully")
             
-            if match:
-                debug.append("Found shows array in page source")
-                print("Found shows array in page source")
+                # 1) Accept terms so the AJAX show-loader can run
+                try:
+                    debug.append("Looking for terms modal...")
+                    print("Looking for terms modal...")
+                    page.wait_for_selector('text="I Understand"', timeout=10000)
+                    debug.append("Found terms modal, clicking 'I Understand'...")
+                    print("Found terms modal, clicking 'I Understand'...")
+                    page.click('text="I Understand"')
+                    debug.append("Terms modal dismissed")
+                    print("Terms modal dismissed")
+                except Exception as e:
+                    msg = f"No terms modal found or couldn't click: {e}"
+                    debug.append(msg)
+                    print(msg)
                 
-                shows_json = match.group(1)
-                shows_data = json.loads(shows_json)
+                # Wait for the page to load completely after modal dismissal
+                page.wait_for_timeout(3000)
                 
-                debug.append(f"Parsed {len(shows_data)} shows from JSON")
-                print(f"Parsed {len(shows_data)} shows from JSON")
+                # Grab the page's HTML and extract the shows JSON directly
+                debug.append("Extracting shows from page HTML...")
+                print("Extracting shows from page HTML...")
                 
-                # Now normalize each show into your list
-                for show in shows_data:
-                    # Only include shows that have pricing (ShowLetUsKnow: false)
-                    # Shows with ShowLetUsKnow: true don't have pricing yet
-                    if show.get('ShowLetUsKnow', True) == False:
-                        slug = show.get('Url') or show.get('ShowUrlEN') or show.get('url') or show.get('slug')
-                        title = show.get('ShowName') or show.get('SortName') or show.get('title') or show.get('name')
-                        first_performance = show.get('FirstPerformance', '')
-                        on_sale_through = show.get('OnSaleThrough', '')
-                        
-                        if slug and title:
-                            # Ensure slug starts with /
-                            if not slug.startswith('/'):
-                                slug = '/' + slug
+                html = page.content()
+                
+                # Use a regex to pull out the `shows = [...]` JSON blob
+                import re, json
+                match = re.search(r'var shows\s*=\s*(\[\{.*?\}\]);', html, re.S)
+                if not match:
+                    debug.append("Couldn't find the shows array in the page source")
+                    print("Couldn't find the shows array in the page source")
+                    # Try alternative patterns
+                    alt_patterns = [
+                        r'shows\s*=\s*(\[\{.*?\}\])',
+                        r'showsList\s*=\s*(\[\{.*?\}\])',
+                        r'data\.shows\s*=\s*(\[\{.*?\}\])',
+                        r'"shows"\s*:\s*(\[\{.*?\}\])'
+                    ]
+                    
+                    for pattern in alt_patterns:
+                        match = re.search(pattern, html, re.S)
+                        if match:
+                            debug.append(f"Found shows using alternative pattern: {pattern}")
+                            print(f"Found shows using alternative pattern: {pattern}")
+                            break
+                
+                if match:
+                    debug.append("Found shows array in page source")
+                    print("Found shows array in page source")
+                    
+                    shows_json = match.group(1)
+                    shows_data = json.loads(shows_json)
+                    
+                    debug.append(f"Parsed {len(shows_data)} shows from JSON")
+                    print(f"Parsed {len(shows_data)} shows from JSON")
+                    
+                    # Now normalize each show into your list
+                    for show in shows_data:
+                        # Only include shows that have pricing (ShowLetUsKnow: false)
+                        # Shows with ShowLetUsKnow: true don't have pricing yet
+                        if show.get('ShowLetUsKnow', True) == False:
+                            slug = show.get('Url') or show.get('ShowUrlEN') or show.get('url') or show.get('slug')
+                            title = show.get('ShowName') or show.get('SortName') or show.get('title') or show.get('name')
+                            first_performance = show.get('FirstPerformance', '')
+                            on_sale_through = show.get('OnSaleThrough', '')
                             
-                            full_url = base_url + slug
-                            shows.append({
-                                'title': title.strip(),
-                                'url': full_url,
-                                'firstPerformance': first_performance,
-                                'onSaleThrough': on_sale_through
-                            })
-                            msg = f"Found show with pricing: {title.strip()} -> {full_url} (First: {first_performance}, Sale Through: {on_sale_through})"
-                            debug.append(msg)
-                            print(msg)
-                    else:
-                        # Debug: show which shows are being skipped
-                        title = show.get('ShowName') or show.get('SortName') or show.get('title') or show.get('name') or 'Unknown'
-                        skip_msg = f"Skipped show (no pricing yet): {title}"
-                        debug.append(skip_msg)
-                        print(skip_msg)
+                            if slug and title:
+                                # Ensure slug starts with /
+                                if not slug.startswith('/'):
+                                    slug = '/' + slug
+                                
+                                full_url = base_url + slug
+                                shows.append({
+                                    'title': title.strip(),
+                                    'url': full_url,
+                                    'firstPerformance': first_performance,
+                                    'onSaleThrough': on_sale_through
+                                })
+                                msg = f"Found show with pricing: {title.strip()} -> {full_url} (First: {first_performance}, Sale Through: {on_sale_through})"
+                                debug.append(msg)
+                                print(msg)
+                        else:
+                            # Debug: show which shows are being skipped
+                            title = show.get('ShowName') or show.get('SortName') or show.get('title') or show.get('name') or 'Unknown'
+                            skip_msg = f"Skipped show (no pricing yet): {title}"
+                            debug.append(skip_msg)
+                            print(skip_msg)
+                    
+                    msg = f"Found {len(shows)} shows via inline JSON"
+                    debug.append(msg)
+                    print(msg)
+                else:
+                    debug.append("Could not find shows array with any pattern")
+                    print("Could not find shows array with any pattern")
                 
-                msg = f"Found {len(shows)} shows via inline JSON"
+            except Exception as e:
+                msg = f"Error during page operations: {e}"
                 debug.append(msg)
                 print(msg)
-            else:
-                debug.append("Could not find shows array with any pattern")
-                print("Could not find shows array with any pattern")
-            
-        except Exception as e:
-            msg = f"Error scraping Broadway Inbound: {e}"
-            debug.append(msg)
-            print(msg)
-            
-        finally:
-            browser.close()
+                
+            finally:
+                try:
+                    browser.close()
+                    debug.append("🔒 Browser closed successfully")
+                    print("🔒 Browser closed successfully")
+                except Exception as e:
+                    debug.append(f"⚠️ Error closing browser: {e}")
+                    print(f"⚠️ Error closing browser: {e}")
+    
+    except Exception as e:
+        msg = f"❌ Critical error in get_broadway_shows: {e}"
+        debug.append(msg)
+        print(msg)
+        import traceback
+        debug.append(f"📋 Traceback: {traceback.format_exc()}")
     
     return shows, debug
 
@@ -173,13 +225,7 @@ def scrape_pricing(url: str, from_date: str, to_date: str) -> dict:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor'
-            ]
+            args=get_browser_args()
         )
         page = browser.new_page()
 
