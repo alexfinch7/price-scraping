@@ -3,8 +3,16 @@ import json
 import sys
 import re
 import requests
-subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+import subprocess
 from playwright.sync_api import sync_playwright
+
+# Install Playwright browsers on first import (for cloud deployment)
+try:
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], 
+                  check=True, capture_output=True, timeout=60)
+except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+    print(f"Warning: Playwright browser installation failed: {e}")
+    # Continue anyway - browsers might already be installed
 
 # -------------------------
 # Broadway Inbound show extraction (HTTP-based, no browser needed)
