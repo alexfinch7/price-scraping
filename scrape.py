@@ -3,16 +3,15 @@ import json
 import sys
 import re
 import requests
-import subprocess
+import os
 from playwright.sync_api import sync_playwright
 
-# Install Playwright browsers on first import (for cloud deployment)
+# Install Playwright browsers and dependencies (for cloud deployment)
 try:
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], 
-                  check=True, capture_output=True, timeout=60)
-except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-    print(f"Warning: Playwright browser installation failed: {e}")
-    # Continue anyway - browsers might already be installed
+    os.system('playwright install')
+    os.system('playwright install-deps')
+except Exception as e:
+    print(f"Warning: Playwright installation commands failed: {e}")
 
 # -------------------------
 # Broadway Inbound show extraction (HTTP-based, no browser needed)
@@ -121,9 +120,7 @@ def scrape_pricing(url: str, from_date: str, to_date: str) -> dict:
             args=[
                 '--no-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor'
+                '--disable-gpu'
             ]
         )
         page = browser.new_page()
