@@ -1,2 +1,10 @@
-chromium-browser
-chromium-chromedriver 
+chromium
+chromium-driver
+libglib2.0-0
+libnss3-dev
+libatk-bridge2.0-0
+libdrm2
+libxkbcommon0
+libgtk-3-0
+libxss1
+libasound2 

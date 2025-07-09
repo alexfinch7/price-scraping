@@ -23,7 +23,16 @@ def get_broadway_shows() -> tuple:
     base_url = "https://www.broadwayinbound.com"
     
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor'
+            ]
+        )
         page = browser.new_page()
         
         try:
@@ -162,7 +171,16 @@ def scrape_pricing(url: str, from_date: str, to_date: str) -> dict:
     }
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor'
+            ]
+        )
         page = browser.new_page()
 
         # 1) Go to the page
