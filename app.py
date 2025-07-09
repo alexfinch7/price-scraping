@@ -67,7 +67,6 @@ def load_broadway_shows():
     """Load Broadway shows from the website"""
     with st.spinner("Loading Broadway shows..."):
         try:
-            st.info("🔍 Attempting to scrape Broadway Inbound for shows...")
             shows, debug_messages = get_broadway_shows()
             
             # Display debug information
@@ -76,31 +75,18 @@ def load_broadway_shows():
                     for message in debug_messages:
                         st.text(message)
             
+            st.session_state.broadway_shows = shows
+            st.session_state.shows_loaded = True
+            
             if shows:
-                st.session_state.broadway_shows = shows
-                st.session_state.shows_loaded = True
-                st.success(f"✅ Successfully loaded {len(shows)} Broadway shows!")
-                st.info("📝 You can now add tasks and configure scraping!")
-                return shows
+                st.success(f"Successfully loaded {len(shows)} Broadway shows!")
             else:
-                st.warning("⚠️ No shows were found. This might be a scraping issue.")
-                st.error("🔧 Possible issues: Network connectivity, website changes, or browser setup in cloud environment")
-                # Still mark as loaded so we don't get stuck
-                st.session_state.shows_loaded = True
-                st.session_state.broadway_shows = []
-                return []
+                st.warning("No shows were found. Check the debug information above.")
+            
+            return shows
             
         except Exception as e:
-            st.error(f"❌ Error loading shows: {str(e)}")
-            st.error(f"🔧 Error type: {type(e).__name__}")
-            # Show more detailed error info
-            import traceback
-            with st.expander("Full Error Details", expanded=False):
-                st.code(traceback.format_exc())
-            
-            # Still mark as loaded so user isn't stuck
-            st.session_state.shows_loaded = True
-            st.session_state.broadway_shows = []
+            st.error(f"Error loading shows: {e}")
             return []
 
 def validate_date(date_str):
@@ -260,23 +246,10 @@ def run_all_tasks():
 
 # Load shows if not already loaded
 if not st.session_state.shows_loaded:
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        if st.button("🔄 Load Broadway Shows", use_container_width=True, type="primary"):
-            load_broadway_shows()
-            st.rerun()
-        
-        # Add manual fallback option
-        if st.button("🔧 Skip Loading (Test Mode)", use_container_width=True):
-            st.session_state.shows_loaded = True
-            st.session_state.broadway_shows = [
-                {"title": "Test Show 1", "url": "https://example.com/test1", "firstPerformance": "1/1/2024", "onSaleThrough": "12/31/2024"},
-                {"title": "Test Show 2", "url": "https://example.com/test2", "firstPerformance": "1/1/2024", "onSaleThrough": "12/31/2024"}
-            ]
-            st.info("⚙️ Using test data. Scraping may not work, but you can test the interface.")
-            st.rerun()
-    
-    st.info("Click the button above to load available Broadway shows, or use test mode if loading fails.")
+    if st.button("🔄 Load Broadway Shows", use_container_width=True):
+        load_broadway_shows()
+        st.rerun()
+    st.info("Click the button above to load available Broadway shows")
     st.stop()
 
 # Only show task configuration if not running
@@ -293,10 +266,10 @@ if not st.session_state.is_running:
             # Task header
             st.markdown(f"""
                 <div class="task-header">
-                    🎭 Task {task['id']} 
-                    <span style="font-size: 0.8em; color: #6b7280;">
-                        {task.get('status', 'Ready')}
-                    </span>
+                🎭 Task {task['id']} 
+                <span style="font-size: 0.8em; color: #6b7280;">
+                    {task.get('status', 'Ready')}
+                </span>
                 </div>
             """, unsafe_allow_html=True)
             
