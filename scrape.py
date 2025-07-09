@@ -3,6 +3,7 @@ import json
 import sys
 import re
 import requests
+subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
 from playwright.sync_api import sync_playwright
 
 # -------------------------
