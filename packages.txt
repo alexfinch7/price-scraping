@@ -1,10 +1,12 @@
-chromium
-chromium-driver
-libglib2.0-0
-libnss3-dev
-libatk-bridge2.0-0
-libdrm2
-libxkbcommon0
-libgtk-3-0
-libxss1
-libasound2 
+# Minimal dependencies for HTTP-based scraping
+# Browser dependencies commented out since we're using HTTP-first approach
+# chromium
+# chromium-driver
+# libglib2.0-0
+# libnss3-dev
+# libatk-bridge2.0-0
+# libdrm2
+# libxkbcommon0
+# libgtk-3-0
+# libxss1
+# libasound2 

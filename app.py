@@ -464,7 +464,12 @@ if st.session_state.results and not st.session_state.is_running:
                     )
             
             if result["result"].get("error"):
-                st.error(f"Error: {result['result']['error']}")
+                error_msg = result["result"]["error"]
+                if "Browser automation not available" in error_msg:
+                    st.warning(f"⚠️ {error_msg}")
+                    st.info("💡 **Tip**: This show's pricing data requires manual checking. Please visit the show's page directly to view current pricing.")
+                else:
+                    st.error(f"Error: {error_msg}")
             
             scraped_data = result["result"].get("scrapedData", [])
             if scraped_data:
