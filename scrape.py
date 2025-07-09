@@ -87,85 +87,18 @@ def get_broadway_shows() -> tuple:
 
 def scrape_pricing(url: str, from_date: str, to_date: str) -> dict:
     """
-    Try to scrape pricing data using HTTP requests first, fallback to browser if needed.
-    
-    1) First attempt: Fetch the page via HTTP and look for embedded pricing data
-    2) Fallback: Use Playwright if HTTP method doesn't work
-    
-    Returns a dict:
+    1) Navigate to `url`.
+    2) Find and click the Pricing Grid tab (#pricing-grid-tab-trigger).
+    3) Wait for Knockout to render the #pricing-grid section.
+    4) Extract each "Description" and "Price" pair from:
+         #pricing-grid .product-data-column.product-section span
+         #pricing-grid .product-data-column.price span
+    5) Return a dict:
        {
-         "scrapedData": [ { "dateTime": "...", "description": "...", "price": "..." }, ... ],
+         "scrapedData": [ { "description": "...", "price": "..." }, ... ],
          "clickSuccessful": True/False,
          "error": None or "error message"
        }
-    """
-    result = {
-        "scrapedData": [],
-        "clickSuccessful": False,
-        "error": None
-    }
-    
-    # First try: HTTP-based approach
-    try:
-        print(f"Attempting HTTP-based pricing scrape for {url}")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
-        
-        # Look for embedded pricing data in the page source
-        # This might be in JavaScript variables or JSON-LD scripts
-        pricing_patterns = [
-            r'var\s+pricingData\s*=\s*(\[.*?\]);',
-            r'var\s+productData\s*=\s*(\[.*?\]);',
-            r'window\.pricing\s*=\s*(\[.*?\]);',
-            r'"@type":\s*"Offer".*?"price":\s*"([^"]+)"',
-            r'data-price="([^"]+)"',
-        ]
-        
-        for pattern in pricing_patterns:
-            matches = re.findall(pattern, html, re.DOTALL)
-            if matches:
-                print(f"Found potential pricing data with pattern: {pattern}")
-                # Try to parse the first match as JSON
-                try:
-                    if pattern.endswith(']):'):  # JSON array patterns
-                        data = json.loads(matches[0])
-                        if isinstance(data, list) and len(data) > 0:
-                            # Convert to our expected format
-                            for item in data:
-                                if isinstance(item, dict):
-                                    result["scrapedData"].append({
-                                        "dateTime": item.get("date", from_date),
-                                        "description": item.get("description", item.get("name", "Unknown")),
-                                        "price": item.get("price", item.get("cost", "Unknown"))
-                                    })
-                            result["clickSuccessful"] = True
-                            return result
-                except (json.JSONDecodeError, KeyError):
-                    continue
-        
-        # If no embedded data found, we'll need to use the fallback
-        print("No embedded pricing data found, checking if Playwright is available...")
-        
-    except requests.RequestException as e:
-        print(f"HTTP request failed: {e}")
-        result["error"] = f"HTTP request failed: {e}"
-    
-    # Fallback: Try Playwright (but handle gracefully if not available)
-    try:
-        return scrape_pricing_with_browser(url, from_date, to_date)
-    except Exception as e:
-        error_msg = str(e)
-        if "Executable doesn't exist" in error_msg or "playwright install" in error_msg:
-            result["error"] = "Browser automation not available in this environment. This show's pricing may require manual checking."
-        else:
-            result["error"] = f"Browser scraping failed: {error_msg}"
-        return result
-
-
-def scrape_pricing_with_browser(url: str, from_date: str, to_date: str) -> dict:
-    """
-    Original browser-based pricing scraping function (kept as fallback).
     """
     result = {
         "scrapedData": [],
