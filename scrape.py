@@ -128,6 +128,70 @@ def scrape_pricing(url: str, from_date: str, to_date: str) -> dict:
         # 1) Go to the page
         page.goto(url)
 
+        # 1.5) Handle GDPR modal if present
+        try:
+            # Wait a bit for the page to load and modal to appear
+            page.wait_for_timeout(2000)
+            
+            # Check for GDPR modal and dismiss it
+            gdpr_modal = page.query_selector("#gdpr-container")
+            if gdpr_modal and gdpr_modal.is_visible():
+                # Try different common GDPR accept button selectors
+                accept_selectors = [
+                    # Specific selectors for this site's GDPR modal
+                    "#gdpr-agree-btn",
+                    "#gdpr-container button:has-text('I Understand')",
+                    "#gdpr-container .gdpr-btn-container button",
+                    
+                    # Generic fallbacks for other GDPR modal variations
+                    "#gdpr-container button[type='submit']",
+                    "#gdpr-container button[type='button']",
+                    "#gdpr-container .btn-primary",
+                    "#gdpr-container .btn-success",
+                    "#gdpr-container .btn-pink", 
+                    "#gdpr-container button:has-text('Accept')",
+                    "#gdpr-container button:has-text('Agree')",
+                    "#gdpr-container button:has-text('OK')",
+                    "#gdpr-container button:has-text('Continue')",
+                    "#gdpr-container button:has-text('Understood')",
+                    "#gdpr-container button:has-text('Got it')",
+                    "#gdpr-container .modal-footer button:first-child",
+                    "#gdpr-container .modal-footer button:last-child",
+                    "#gdpr-container .text-uppercase"
+                ]
+                
+                gdpr_dismissed = False
+                for selector in accept_selectors:
+                    accept_button = page.query_selector(selector)
+                    if accept_button and accept_button.is_visible():
+                        try:
+                            accept_button.click()
+                            # Wait for modal to disappear
+                            page.wait_for_selector("#gdpr-container", state="hidden", timeout=5000)
+                            gdpr_dismissed = True
+                            break
+                        except:
+                            continue
+                
+                # If we couldn't find a button, try clicking outside the modal or pressing Escape
+                if not gdpr_dismissed:
+                    try:
+                        # Try pressing Escape key
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(1000)
+                        
+                        # If modal is still there, try clicking outside it
+                        if page.query_selector("#gdpr-container") and page.query_selector("#gdpr-container").is_visible():
+                            # Click outside the modal (on the backdrop)
+                            page.click("body", position={"x": 10, "y": 10})
+                            page.wait_for_timeout(1000)
+                    except:
+                        pass
+                        
+        except Exception as e:
+            # Don't fail the entire scraping if GDPR handling fails
+            print(f"Warning: GDPR modal handling failed: {e}")
+
         # 2) Click the "Pricing Grid" tab
         trigger = page.query_selector("#pricing-grid-tab-trigger")
         if not trigger:

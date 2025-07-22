@@ -292,7 +292,6 @@ if not st.session_state.is_running:
                     selected_show = st.selectbox(
                         "Show",
                         show_options,
-                        index=current_index,
                         key=f"show_select_{task['id']}"
                     )
                     
@@ -313,49 +312,46 @@ if not st.session_state.is_running:
                 # Get date constraints for this show
                 min_date, max_date = get_show_date_constraints(task, st.session_state.broadway_shows)
                 
-                # Parse existing dates for the range picker
-                existing_from = parse_date_string(task["from_date"])
-                existing_to = parse_date_string(task["to_date"])
-                
-                # If we have both dates, use them as the default range
-                if existing_from and existing_to:
-                    default_range = (existing_from, existing_to)
-                elif existing_from:
-                    default_range = (existing_from, existing_from)
-                else:
-                    default_range = ()
-                
-                date_range = st.date_input(
-                    "Date Range",
-                    value=default_range,
-                    key=f"date_range_{task['id']}",
-                    min_value=min_date,
+                # 1) Compute two date objects to feed back in:
+                existing_from = parse_date_string(task["from_date"]) or min_date
+                existing_to = parse_date_string(task["to_date"]) or min_date
+
+                # 2) Pass them as a 2-tuple to value= → forces range picker
+                # start_date, end_date = st.date_input(
+                #     "Date Range",
+                #     value=(existing_from, existing_to),    # <-- tuple = range mode
+                #     min_value=min_date,
+                #     max_value=max_date,
+                #     key=f"date_range_{task['id']}",
+                #     help=f"Select dates between {min_date:%m/%d/%Y} and {max_date:%m/%d/%Y}"
+                # )
+                default_date = datetime.now().date()
+                if min_date > datetime.now().date():
+                    default_date = min_date
+                d = st.date_input(
+                    "Date Range", 
+                    value=(default_date, default_date),    # <-- tuple = range mode
+                    min_value = (min_date if min_date > datetime.now().date() else datetime.now().date()),
                     max_value=max_date,
-                    help=f"Select dates between {min_date.strftime('%m/%d/%Y')} and {max_date.strftime('%m/%d/%Y')}"
+                    key=f"date_range_{task['id']}",
+                    help=f"Select dates between {min_date:%m/%d/%Y} and {max_date:%m/%d/%Y}"
                 )
-                
+                 # Handle intermediate selection state (when user has only picked first date)
+                if isinstance(d, (list, tuple)) and len(d) == 2:
+                     start_date, end_date = d
+                elif isinstance(d, date):
+                     # User is halfway through selection - use same date for both
+                     start_date = end_date = d
+                else:
+                     # Fallback to default
+                     start_date = end_date = default_date
                 # Show date constraints info if a show is selected (below date picker)
                 if task.get("url") and (min_date != date(2020, 1, 1) or max_date != date(2030, 12, 31)):
                     st.caption(f"📅 Available: {min_date.strftime('%m/%d/%Y')} - {max_date.strftime('%m/%d/%Y')}")
                 
-                # Handle the date range result
-                if isinstance(date_range, tuple) and len(date_range) == 2:
-                    # User selected a range
-                    task["from_date"] = format_date_for_task(date_range[0])
-                    task["to_date"] = format_date_for_task(date_range[1])
-                elif isinstance(date_range, date):
-                    # User selected a single date
-                    task["from_date"] = format_date_for_task(date_range)
-                    task["to_date"] = format_date_for_task(date_range)
-                elif hasattr(date_range, '__len__') and len(date_range) == 1:
-                    # User selected one date in what should be a range
-                    single_date = date_range[0] if isinstance(date_range[0], date) else date_range
-                    task["from_date"] = format_date_for_task(single_date)
-                    task["to_date"] = format_date_for_task(single_date)
-                else:
-                    # No date selected yet
-                    task["from_date"] = ""
-                    task["to_date"] = ""
+                # 3) Unpack what you get back (always a tuple now)
+                task["from_date"] = start_date.strftime("%m/%d/%Y")
+                task["to_date"] = end_date.strftime("%m/%d/%Y")
             
             # Bottom action row
             col_left, col_right = st.columns([3, 1])
