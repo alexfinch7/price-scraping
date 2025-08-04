@@ -169,10 +169,10 @@ def remove_task(task_id):
     """Remove a task by ID"""
     st.session_state.tasks = [t for t in st.session_state.tasks if t["id"] != task_id]
 
-def format_pricing_as_text(scraped_data):
-    """Format pricing data as plain text grouped by date"""
+def format_pricing_by_date(scraped_data):
+    """Format pricing data as dictionary grouped by date"""
     if not scraped_data:
-        return ""
+        return {}
     
     # Group data by dateTime
     grouped_data = {}
@@ -182,21 +182,28 @@ def format_pricing_as_text(scraped_data):
             grouped_data[date_time] = []
         grouped_data[date_time].append(item)
     
-    # Format as text
-    text_output = []
+    # Format each date group as text
+    formatted_by_date = {}
     for date_time, items in grouped_data.items():
-        # Format the header
-        text_output.append(f"Below is the group pricing for {date_time}, subject to change and availability.\n")
+        text_lines = [f"\n Below is the group pricing for {date_time}, subject to change and availability.\n"]
         
         # Format the pricing items
         for item in items:
             description = item.get('description', 'Unknown Description')
             price = item.get('price', 'Unknown Price')
-            text_output.append(f"{description} - {price}")
+            
+            # Split descriptions with "/" into separate lines with same price
+            if '/' in description:
+                sections = [section.strip() for section in description.split('/')]
+                for section in sections:
+                    if section:  # Skip empty sections
+                        text_lines.append(f"{section} - {price}")
+            else:
+                text_lines.append(f"{description} - {price}")
         
-        text_output.append("")  # Add blank line after each date group
+        formatted_by_date[date_time] = "\n".join(text_lines)
     
-    return "\n".join(text_output).strip()
+    return formatted_by_date
 
 def run_scraping_task(task):
     """Run a single scraping task"""
@@ -466,17 +473,13 @@ if st.session_state.results and not st.session_state.is_running:
             if scraped_data:
                 st.dataframe(scraped_data, use_container_width=True)
                 
-                # Add plain text formatted pricing
+                # Add separate code blocks for each date/time with built-in copy buttons
                 st.markdown("### 📋 Formatted Pricing Text")
-                formatted_text = format_pricing_as_text(scraped_data)
-                if formatted_text:
-                    st.text_area(
-                        "Copy the text below:",
-                        value=formatted_text,
-                        height=200,
-                        key=f"formatted_text_{i}",
-                        help="Select all text and copy for use in emails or documents"
-                    )
+                formatted_by_date = format_pricing_by_date(scraped_data)
+                if formatted_by_date:
+                    for j, (date_time, formatted_text) in enumerate(formatted_by_date.items()):
+                        st.markdown(f"**📅 {date_time}**")
+                        st.code(f"\n{formatted_text}", language=None)
                 else:
                     st.info("No pricing data to format")
             else:
