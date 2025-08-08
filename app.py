@@ -169,6 +169,18 @@ def remove_task(task_id):
     """Remove a task by ID"""
     st.session_state.tasks = [t for t in st.session_state.tasks if t["id"] != task_id]
 
+def extract_price_value(price_str):
+    """Extract numeric value from price string for sorting"""
+    import re
+    # Remove currency symbols and extract numbers
+    price_match = re.search(r'[\d,]+\.?\d*', price_str.replace('$', '').replace(',', ''))
+    if price_match:
+        try:
+            return float(price_match.group())
+        except ValueError:
+            pass
+    return 0.0  # Default for unparseable prices
+
 def format_pricing_by_date(scraped_data):
     """Format pricing data as dictionary grouped by date"""
     if not scraped_data:
@@ -185,7 +197,10 @@ def format_pricing_by_date(scraped_data):
     # Format each date group as text
     formatted_by_date = {}
     for date_time, items in grouped_data.items():
-        text_lines = [f"\n Below is the group pricing for {date_time}, subject to change and availability.\n"]
+        text_lines = [f"\nBelow is the group pricing for {date_time}, subject to change and availability.\n"]
+        
+        # Collect all pricing lines with their prices for sorting
+        pricing_lines = []
         
         # Format the pricing items
         for item in items:
@@ -197,9 +212,18 @@ def format_pricing_by_date(scraped_data):
                 sections = [section.strip() for section in description.split('/')]
                 for section in sections:
                     if section:  # Skip empty sections
-                        text_lines.append(f"{section} - {price}")
+                        line = f"{section} - {price}"
+                        pricing_lines.append((line, extract_price_value(price)))
             else:
-                text_lines.append(f"{description} - {price}")
+                line = f"{description} - {price}"
+                pricing_lines.append((line, extract_price_value(price)))
+        
+        # Sort by price (highest to lowest)
+        pricing_lines.sort(key=lambda x: x[1], reverse=True)
+        
+        # Add sorted lines to text_lines
+        for line, _ in pricing_lines:
+            text_lines.append(line)
         
         formatted_by_date[date_time] = "\n".join(text_lines)
     
