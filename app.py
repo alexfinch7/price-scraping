@@ -181,8 +181,28 @@ def extract_price_value(price_str):
             pass
     return 0.0  # Default for unparseable prices
 
-def format_pricing_by_date(scraped_data):
-    """Format pricing data as dictionary grouped by date"""
+def normalize_price_display(price_str):
+    """Return a display-friendly price string by removing trailing .00 only.
+
+    Examples:
+    "$169.00" -> "$169"
+    "$169.50" -> "$169.50" (unchanged)
+    "$99.00 - $299.00" -> "$99 - $299"
+    """
+    import re
+    if not isinstance(price_str, str):
+        return price_str
+    s = price_str.strip()
+    # Remove any occurrence of '.00' that directly follows a digit and is not followed by another digit
+    return re.sub(r'(?<=\d)\.00(?!\d)', '', s)
+
+def format_pricing_by_date(scraped_data, show_title=None):
+    """Format pricing data as dictionary grouped by date.
+
+    If `show_title` is provided, the header will read:
+    "Below is group pricing for SHOW on DAY, DATE at TIME, subject to change and availability."
+    Otherwise, it falls back to the original header using the raw date/time text.
+    """
     if not scraped_data:
         return {}
     
@@ -197,32 +217,99 @@ def format_pricing_by_date(scraped_data):
     # Format each date group as text
     formatted_by_date = {}
     for date_time, items in grouped_data.items():
-        text_lines = [f"\nBelow is the group pricing for {date_time}, subject to change and availability.\n"]
+        # Build header: "Below is group pricing for SHOW on DAY, DATE at TIME"
+        header_text = None
+        if show_title:
+            # Expected formats like: "SUNDAY, 3/8/2026 6:30PM" or "SUNDAY, 03/08/2026 6:30 PM"
+            # Try to parse into DAY, DATE and TIME parts
+            import re as _re
+            m = _re.match(r"^\s*([A-Za-z]+),\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})\s+([0-9]{1,2}:[0-9]{2}\s*[APMapm]{2})\s*$", date_time)
+            if m:
+                day_part, date_part, time_part = m.group(1), m.group(2), m.group(3).replace(" ", "") if " " in m.group(3) else m.group(3)
+                # Normalize AM/PM to no extra spaces like "6:30PM"
+                time_part = time_part.upper().replace(" ", "")
+                # Make day not all caps: use sentence-style capitalization
+                day_part_normalized = day_part.capitalize()
+                header_text = f"Below is group pricing for {show_title} on {day_part_normalized}, {date_part} at {time_part}, subject to change and availability.\n"
+            else:
+                # Fallback if we cannot parse the string format: still normalize leading day portion
+                _m2 = _re.match(r"^\s*([A-Za-z]+)(.*)$", date_time)
+                if _m2:
+                    _day, _rest = _m2.group(1), _m2.group(2)
+                    normalized_dt = f"{_day.capitalize()}{_rest}"
+                else:
+                    normalized_dt = date_time
+                header_text = f"Below is group pricing for {show_title} on {normalized_dt}, subject to change and availability.\n"
+        else:
+            # No show title provided; still normalize day casing if present
+            import re as _re
+            m = _re.match(r"^\s*([A-Za-z]+),\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})\s+([0-9]{1,2}:[0-9]{2}\s*[APMapm]{2})\s*$", date_time)
+            if m:
+                day_part, date_part, time_part = m.group(1), m.group(2), m.group(3).replace(" ", "") if " " in m.group(3) else m.group(3)
+                time_part = time_part.upper().replace(" ", "")
+                header_text = f"Below is group pricing for {day_part.capitalize()}, {date_part} at {time_part}, subject to change and availability.\n"
+            else:
+                _m2 = _re.match(r"^\s*([A-Za-z]+)(.*)$", date_time)
+                if _m2:
+                    _day, _rest = _m2.group(1), _m2.group(2)
+                    normalized_dt = f"{_day.capitalize()}{_rest}"
+                else:
+                    normalized_dt = date_time
+                header_text = f"Below is group pricing for {normalized_dt}, subject to change and availability.\n"
+
+        text_lines = [header_text]
         
         # Collect all pricing lines with their prices for sorting
         pricing_lines = []
+
+        # Helper to categorize by seating area for grouping
+        def _categorize(section_text: str):
+            t = (section_text or "").lower()
+            # Premium tier first
+            if "premium" in t or "mid-premium" in t or "mid premium" in t:
+                return ("premium", 0)
+            if "orchestra" in t or "orch" in t:
+                return ("orchestra", 1)
+            if "mezzanine" in t or "mezz" in t:
+                return ("mezzanine", 2)
+            if "balcony" in t or "balc" in t:
+                return ("balcony", 3)
+            return ("other", 4)
         
         # Format the pricing items
         for item in items:
             description = item.get('description', 'Unknown Description')
             price = item.get('price', 'Unknown Price')
+            display_price = normalize_price_display(price)
             
             # Split descriptions with "/" into separate lines with same price
             if '/' in description:
                 sections = [section.strip() for section in description.split('/')]
                 for section in sections:
                     if section:  # Skip empty sections
-                        line = f"{section} - {price}"
-                        pricing_lines.append((line, extract_price_value(price)))
+                        line = f"{section} - {display_price}"
+                        _, cat_rank = _categorize(section)
+                        pricing_lines.append((line, extract_price_value(display_price), cat_rank))
             else:
-                line = f"{description} - {price}"
-                pricing_lines.append((line, extract_price_value(price)))
+                line = f"{description} - {display_price}"
+                _, cat_rank = _categorize(description)
+                pricing_lines.append((line, extract_price_value(display_price), cat_rank))
         
-        # Sort by price (highest to lowest)
-        pricing_lines.sort(key=lambda x: x[1], reverse=True)
+        # Remove exact duplicate lines (same seat text and same price)
+        # Duplicates can occur if the source data repeats entries for a date
+        seen_lines = set()
+        deduped_pricing_lines = []
+        for line, numeric_price, cat_rank in pricing_lines:
+            if line not in seen_lines:
+                seen_lines.add(line)
+                deduped_pricing_lines.append((line, numeric_price, cat_rank))
+        pricing_lines = deduped_pricing_lines
+
+        # Sort by category group then by price descending within each group
+        pricing_lines.sort(key=lambda x: (x[2], -x[1], x[0]))
         
         # Add sorted lines to text_lines
-        for line, _ in pricing_lines:
+        for line, _, _ in pricing_lines:
             text_lines.append(line)
         
         formatted_by_date[date_time] = "\n".join(text_lines)
@@ -495,17 +582,18 @@ if st.session_state.results and not st.session_state.is_running:
             
             scraped_data = result["result"].get("scrapedData", [])
             if scraped_data:
-                st.dataframe(scraped_data, use_container_width=True)
-                
                 # Add separate code blocks for each date/time with built-in copy buttons
                 st.markdown("### 📋 Formatted Pricing Text")
-                formatted_by_date = format_pricing_by_date(scraped_data)
+                formatted_by_date = format_pricing_by_date(scraped_data, show_title=task.get('show_title'))
                 if formatted_by_date:
                     for j, (date_time, formatted_text) in enumerate(formatted_by_date.items()):
                         st.markdown(f"**📅 {date_time}**")
                         st.code(f"\n{formatted_text}", language=None)
                 else:
                     st.info("No pricing data to format")
+
+                # Show raw table below the formatted text
+                st.dataframe(scraped_data, use_container_width=True)
             else:
                 st.info("No data found for this task")
             
