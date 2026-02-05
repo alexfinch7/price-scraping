@@ -5,6 +5,7 @@ import concurrent.futures
 import asyncio
 import pandas as pd
 from datetime import datetime, date
+from openai import OpenAI
 
 from scrape import scrape_pricing, get_broadway_shows
 from scrape_shows import get_tourstoyou_data, get_broadway_data
@@ -69,6 +70,56 @@ if "shows_loaded" not in st.session_state:
 # Session state for Touring Search
 if "shows_df" not in st.session_state:
     st.session_state.shows_df = None
+if "shows_last_scraped" not in st.session_state:
+    st.session_state.shows_last_scraped = None
+
+# Supabase for touring cache
+from supabase import create_client
+
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+@st.cache_resource
+def get_supabase():
+    """Get Supabase client"""
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def save_cache_to_supabase(df):
+    """Save touring shows to Supabase"""
+    supabase = get_supabase()
+    cache_data = {
+        'shows': df.to_dict(orient='records'),
+        'last_scraped': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    try:
+        supabase.table('touring_cache').upsert({
+            'id': 1,
+            'data': cache_data,
+            'last_updated': datetime.now().isoformat()
+        }).execute()
+        return cache_data['last_scraped']
+    except Exception as e:
+        st.error(f"Failed to save cache: {e}")
+        return cache_data['last_scraped']
+
+def load_cache_from_supabase():
+    """Load touring shows from Supabase"""
+    try:
+        supabase = get_supabase()
+        response = supabase.table('touring_cache').select('data').eq('id', 1).execute()
+        if response.data and len(response.data) > 0:
+            cache_data = response.data[0]['data']
+            if cache_data and 'shows' in cache_data and cache_data['shows']:
+                df = pd.DataFrame(cache_data['shows'])
+                last_scraped = cache_data.get('last_scraped', 'Unknown')
+                return df, last_scraped
+    except Exception as e:
+        st.warning(f"Could not load cache: {e}")
+    return None, None
+
+# Session state for tracking expanded result expanders
+if "expanded_results" not in st.session_state:
+    st.session_state.expanded_results = set()
 
 
 # ------------------------------------------------------------------
@@ -199,6 +250,243 @@ def normalize_price_display(price_str):
     s = price_str.strip()
     # Remove any occurrence of '.00' that directly follows a digit and is not followed by another digit
     return re.sub(r'(?<=\d)\.00(?!\d)', '', s)
+
+def transform_pricing_to_rows(scraped_data):
+    """
+    Transform scraped pricing data so each dateTime has its own row with price tiers as columns.
+    
+    Input format:
+    [
+        { "dateTime": "SUNDAY, 3/8/2026 6:30PM", "description": "Orchestra", "price": "$100" },
+        { "dateTime": "SUNDAY, 3/8/2026 6:30PM", "description": "Mezzanine", "price": "$80" },
+        ...
+    ]
+    
+    Output format:
+    [
+        {
+            "event_date": "Mar 8, 2026",
+            "event_time": "evening",
+            "time": "6:30 PM",
+            "reg_tier_1": "$100",
+            "reg_tier_2": "$80",
+            ...
+        },
+        ...
+    ]
+    """
+    if not scraped_data:
+        return []
+    
+    # Group data by dateTime
+    grouped = {}
+    for item in scraped_data:
+        dt = item.get('dateTime', 'Unknown')
+        if dt not in grouped:
+            grouped[dt] = []
+        grouped[dt].append(item)
+    
+    result = []
+    for date_time, items in grouped.items():
+        row = {}
+        
+        # Parse dateTime string like "SUNDAY, 3/8/2026 6:30PM" or "SUNDAY, 03/08/2026 6:30 PM"
+        m = re.match(r"^\s*([A-Za-z]+),\s*(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2}\s*[APMapm]{2})\s*$", date_time)
+        if m:
+            day_name = m.group(1).capitalize()
+            date_part = m.group(2)  # e.g., "3/8/2026"
+            time_part = m.group(3).upper().replace(" ", "")  # e.g., "6:30PM"
+            
+            # Format date nicely (e.g., "Mar 8, 2026")
+            try:
+                parts = date_part.split('/')
+                month_num = int(parts[0])
+                day_num = int(parts[1])
+                year = parts[2]
+                month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                formatted_date = f"{month_names[month_num]} {day_num}, {year}"
+            except:
+                formatted_date = date_part
+            
+            # Format time nicely (e.g., "6:30 PM")
+            time_formatted = time_part[:-2] + " " + time_part[-2:]
+            
+            # Determine matinee vs evening based on time
+            try:
+                hour = int(time_part.split(':')[0])
+                is_pm = 'PM' in time_part.upper()
+                if is_pm and hour != 12:
+                    hour += 12
+                elif not is_pm and hour == 12:
+                    hour = 0
+                event_time = "matinee" if hour < 17 else "evening"  # Before 5pm = matinee
+            except:
+                event_time = "unknown"
+            
+            row["event_date"] = formatted_date
+            row["event_time"] = event_time
+            row["time"] = time_formatted
+        else:
+            # Fallback if parsing fails
+            row["event_date"] = date_time
+            row["event_time"] = "unknown"
+            row["time"] = ""
+        
+        # Collect prices with their descriptions, splitting on "/" 
+        for item in items:
+            price_str = item.get('price', '')
+            description = item.get('description', '').strip()
+            if description:
+                normalized_price = normalize_price_display(price_str)
+                # Split descriptions with "/" into separate entries with same price
+                if '/' in description:
+                    sections = [section.strip() for section in description.split('/')]
+                    for section in sections:
+                        if section:  # Skip empty sections
+                            row[section] = normalized_price
+                else:
+                    row[description] = normalized_price
+        
+        result.append(row)
+    
+    # Sort result by date
+    def parse_event_date(row):
+        try:
+            date_str = row.get('event_date', '')
+            return datetime.strptime(date_str, "%b %d, %Y")
+        except:
+            return datetime.max
+    
+    result.sort(key=lambda r: (parse_event_date(r), r.get('time', '')))
+    
+    return result
+
+def format_pricing_with_ai(transformed_data):
+    """
+    Use OpenAI to categorize pricing data into standard tiers.
+    Returns the transformed data with AI-processed pricing tiers as a DataFrame.
+    """
+    if not transformed_data:
+        return None, None, "No data to process"
+    
+    # Extract only the description/price pairs (exclude date, event_time, time)
+    exclude_keys = {"event_date", "event_time", "time"}
+    
+    # Collect all unique description:price pairs across all date/times
+    all_prices = {}
+    for row in transformed_data:
+        for key, value in row.items():
+            if key not in exclude_keys:
+                # Track all prices for each description
+                if key not in all_prices:
+                    all_prices[key] = set()
+                all_prices[key].add(value)
+    
+    # Format for the prompt
+    price_text_lines = []
+    for desc, prices in all_prices.items():
+        prices_str = ", ".join(sorted(prices))
+        price_text_lines.append(f"{desc}: {prices_str}")
+    
+    price_text = "\n".join(price_text_lines)
+    
+    prompt = f"""Look at these prices for a broadway show:
+
+{price_text}
+
+Please convert this text into json in this exact format:
+
+{{
+  "Premium": [
+    "lowest premium price",
+    "highest premium price"
+  ],
+  "MidPremium": [
+    "lowest mid premium price",
+    "highest mid premium price"
+  ],
+  "Orchestra": [
+    "lowest orchestra price",
+    "highest orchestra price"
+  ],
+  "FrontMezzanine": [
+    "lowest front mezzanine price",
+    "highest front mezzanine price"
+  ],
+  "RearMezzanine": [
+    "lowest rear mezzanine price",
+    "highest rear mezzanine price"
+  ]
+}}
+
+NOTE: Sometimes there will not be a mid premium tier - in that case do not output anything for midpremium in your final json. All other fields are required.
+Skip any "Student" rates in the original text, and anything that cannot be put into the JSON categories.
+
+Return ONLY the JSON, no other text."""
+
+    try:
+        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        
+        ai_response = response.choices[0].message.content.strip()
+        
+        # Clean up the response (remove markdown code blocks if present)
+        if ai_response.startswith("```"):
+            ai_response = re.sub(r'^```json?\s*', '', ai_response)
+            ai_response = re.sub(r'\s*```$', '', ai_response)
+        
+        # Parse the JSON response
+        pricing_tiers = json.loads(ai_response)
+        
+        # Process pricing tiers: extract numeric values, multiply highest by 1.04, round to nearest dollar
+        processed_tiers = {}
+        for tier, prices in pricing_tiers.items():
+            if len(prices) >= 2:
+                # Extract numeric values (remove $ and any non-numeric chars)
+                price1 = int(round(extract_price_value(prices[0])))
+                price2_raw = extract_price_value(prices[1])
+                # Multiply by 1.04 and round to nearest dollar
+                price2 = int(round(price2_raw * 1.04))
+                processed_tiers[tier] = (price1, price2)
+        
+        # Map tier names to reg_tier columns
+        # Order: Premium, MidPremium (optional), Orchestra, FrontMezzanine, RearMezzanine
+        tier_order = ["Premium", "MidPremium", "Orchestra", "FrontMezzanine", "RearMezzanine"]
+        
+        # Create output rows for DataFrame
+        result_rows = []
+        for row in transformed_data:
+            new_row = {
+                "event_date": row.get("event_date", ""),
+                "event_time": row.get("event_time", ""),
+                "time": row.get("time", "")
+            }
+            
+            # Assign tiers to reg_tier_1 through reg_tier_5
+            tier_num = 1
+            for tier_name in tier_order:
+                if tier_name in processed_tiers:
+                    p1, p2 = processed_tiers[tier_name]
+                    new_row[f"reg_tier_{tier_num}"] = f"${p1} - ${p2}"
+                    tier_num += 1
+            
+            result_rows.append(new_row)
+        
+        # Create DataFrame
+        result_df = pd.DataFrame(result_rows)
+        
+        return result_df, processed_tiers, None
+        
+    except json.JSONDecodeError as e:
+        return None, None, f"Failed to parse AI response as JSON: {e}"
+    except Exception as e:
+        return None, None, f"Error calling OpenAI: {e}"
 
 def format_pricing_by_date(scraped_data, show_title=None):
     """Format pricing data as dictionary grouped by date."""
@@ -389,7 +677,22 @@ async def scrape_all_touring():
         
         combined = pd.concat([df1, df2], ignore_index=True)
         st.session_state.shows_df = combined
-        status.update(label="Scraping complete!", state="complete", expanded=False)
+        
+        # Save to Supabase
+        st.write("Saving to Supabase...")
+        st.session_state.shows_last_scraped = save_cache_to_supabase(combined)
+        
+        status.update(label=f"Scraping complete! Found {len(combined)} shows.", state="complete", expanded=False)
+
+def normalize_date_year(date_str, default_year="2026"):
+    """Add year to date string if it doesn't end with a 4-digit year"""
+    if not isinstance(date_str, str):
+        return date_str
+    s = date_str.strip()
+    # Check if string ends with a 4-digit year
+    if re.search(r'\d{4}$', s):
+        return s
+    return f"{s}, {default_year}"
 
 def parse_start_date(date_str):
     if not isinstance(date_str, str):
@@ -602,6 +905,7 @@ if st.session_state.page == "pricing":
                     status_text.empty()
                 
                 st.session_state.results = results
+                st.session_state.expanded_results = set()  # Reset expanded state for new results
                 st.success("All tasks completed!")
             
             st.session_state.is_running = False
@@ -624,7 +928,13 @@ if st.session_state.page == "pricing":
                 show_name = task.get('show_title', 'Unknown Show')
                 task_title = f"{status_icon} {show_name} ({date_range})"
                 
-                with st.expander(task_title, expanded=False):
+                # Check if this expander should be expanded (user interacted with it)
+                is_expanded = i in st.session_state.expanded_results
+                
+                with st.expander(task_title, expanded=is_expanded):
+                    # Mark this expander as expanded once user opens it
+                    st.session_state.expanded_results.add(i)
+                    
                     col1, col2 = st.columns([3, 1])
                     with col1:
                         st.write(f"**Completed at:** {result['timestamp']}")
@@ -644,6 +954,24 @@ if st.session_state.page == "pricing":
                     
                     scraped_data = result["result"].get("scrapedData", [])
                     if scraped_data:
+                        # Transform data for AI processing
+                        transformed_data = transform_pricing_to_rows(scraped_data)
+                        
+                        # Format Pricing with AI button (centered) - at the top
+                        col_left, col_center, col_right = st.columns([1, 2, 1])
+                        with col_center:
+                            format_clicked = st.button("Process Price Tiers", key=f"format_pricing_{i}", use_container_width=True)
+                        
+                        if format_clicked:
+                            with st.spinner("Processing with AI..."):
+                                result_df, pricing_tiers, error = format_pricing_with_ai(transformed_data)
+                                if error:
+                                    st.error(error)
+                                else:
+                                    st.success("AI processing complete!")
+                                    st.markdown("**AI-Processed Pricing Tiers:**")
+                                    st.dataframe(result_df, use_container_width=True, hide_index=True)
+                        
                         # Add separate code blocks for each date/time with built-in copy buttons
                         st.markdown("### 📋 Formatted Pricing Text")
                         formatted_by_date = format_pricing_by_date(scraped_data, show_title=task.get('show_title'))
@@ -656,18 +984,19 @@ if st.session_state.page == "pricing":
 
                         # Show raw table below the formatted text
                         st.dataframe(scraped_data, use_container_width=True)
+                        
+                        # Raw JSON toggle as details instead of nested expander
+                        if st.checkbox("Show Raw JSON", key=f"raw_json_{i}"):
+                            st.json(transformed_data)
                     else:
                         st.info("No data found for this task")
-                    
-                    # Raw JSON toggle as details instead of nested expander
-                    if st.checkbox("Show Raw JSON", key=f"raw_json_{i}"):
-                        st.json(result["result"])
             
             # Clear results button
             col1, col2, col3 = st.columns([1, 2, 1])
             with col2:
                 if st.button("🗑️ Clear All Results", use_container_width=True):
                     st.session_state.results = []
+                    st.session_state.expanded_results = set()
                     st.rerun()
 
     # Link to Touring Search
@@ -681,20 +1010,42 @@ elif st.session_state.page == "touring":
     # ------------------------------------------------------------------
     # Touring Search UI
     # ------------------------------------------------------------------
-    if st.button("← Back to Pricing Scraper"):
-        st.session_state.page = "pricing"
-        st.rerun()
+    col_back, _ = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            st.session_state.page = "pricing"
+            st.rerun()
 
     st.title("Touring Production Search")
 
-    if st.button("Scrape All Shows", type="primary"):
-        asyncio.run(scrape_all_touring())
+    # Load from Supabase if no data in session
+    if st.session_state.shows_df is None:
+        with st.spinner("Loading cached data..."):
+            cached_df, last_scraped = load_cache_from_supabase()
+        if cached_df is not None:
+            st.session_state.shows_df = cached_df
+            st.session_state.shows_last_scraped = last_scraped
 
-    if st.session_state.shows_df is not None:
+    if st.session_state.shows_df is None:
+        st.info("No cached data found. Click below to scrape shows.")
+        if st.button("Scrape All Shows", type="primary"):
+            asyncio.run(scrape_all_touring())
+            st.rerun()
+    else:
         df = st.session_state.shows_df.copy() # Work on a copy
         
-        # Filter/Search
-        search_term = st.text_input("Search shows, cities, venues...")
+        # Filter/Search + Refresh button
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            search_term = st.text_input("Search shows, cities, venues...")
+        with col2:
+            st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)  # Align with input
+            if st.button("Refresh", use_container_width=True):
+                asyncio.run(scrape_all_touring())
+                st.rerun()
+        
+        if st.session_state.shows_last_scraped:
+            st.caption(f"Last updated: {st.session_state.shows_last_scraped}")
         if search_term:
             # Create a mask for filtering
             mask = df.astype(str).apply(lambda x: x.str.contains(search_term, case=False)).any(axis=1)
@@ -703,50 +1054,57 @@ elif st.session_state.page == "touring":
             display_df = df.reset_index(drop=True)
             
         st.markdown("### Scraped Shows")
-        st.caption("Select a row to generate venue schedule text.")
+        st.caption("Select rows to generate venue schedule text (hold Ctrl/Cmd for multiple).")
 
         # Interactive Table
         event = st.dataframe(
             display_df,
-            selection_mode="single-row",
+            selection_mode="multi-row",
             on_select="rerun",
             use_container_width=True,
             hide_index=True
         )
         
         if len(event.selection.rows) > 0:
-            selected_index = event.selection.rows[0]
-            # Get the actual row from display_df
-            selected_row = display_df.iloc[selected_index]
+            # Collect unique venue/location pairs from selected rows
+            selected_venues = []
+            seen = set()
+            for idx in event.selection.rows:
+                selected_row = display_df.iloc[idx]
+                venue = str(selected_row['VENUE']).strip()
+                location = str(selected_row['LOCATION']).strip()
+                key = (venue, location)
+                if key not in seen:
+                    seen.add(key)
+                    selected_venues.append((venue, location))
             
-            venue = selected_row['VENUE']
-            location = selected_row['LOCATION']
+            st.subheader(f"Selected Venue Schedules ({len(selected_venues)})")
             
-            st.subheader("Selected Venue Schedule")
+            all_venue_texts = []
             
-            # Find all shows at this venue/location in the FULL dataframe
-            # Normalize comparison
-            venue_shows = df[
-                (df['VENUE'].astype(str).str.strip() == str(venue).strip()) & 
-                (df['LOCATION'].astype(str).str.strip() == str(location).strip())
-            ].copy()
-            
-            # Sort by date
-            # We handle NaTs by putting them last
-            venue_shows['start_date'] = venue_shows['DATES'].apply(parse_start_date)
-            venue_shows = venue_shows.sort_values('start_date', na_position='last')
-            
-            # Format text
-            # Albuquerque, NM - POPEJOY HALL
-            # A Beautiful Noise: The Neil Diamond Musical: February 3 - 8, 2026
-            
-            header = f"{location} - {str(venue).upper()}"
-            lines = [header]
-            
-            for _, row in venue_shows.iterrows():
-                line = f"{row['SHOW']}: {row['DATES']}"
-                lines.append(line)
+            for venue, location in selected_venues:
+                # Find all shows at this venue/location in the FULL dataframe
+                venue_shows = df[
+                    (df['VENUE'].astype(str).str.strip() == venue) & 
+                    (df['LOCATION'].astype(str).str.strip() == location)
+                ].copy()
                 
-            final_text = "\n".join(lines)
+                # Sort by date
+                venue_shows['start_date'] = venue_shows['DATES'].apply(parse_start_date)
+                venue_shows = venue_shows.sort_values('start_date', na_position='last')
+                
+                # Format text
+                header = f"{location} - {venue.upper()}"
+                lines = [header]
+                
+                for _, row in venue_shows.iterrows():
+                    dates = normalize_date_year(row['DATES'])
+                    line = f"{row['SHOW']}: {dates}"
+                    lines.append(line)
+                
+                all_venue_texts.append("\n".join(lines))
             
-            st.text_area("Copy Text", final_text, height=200)
+            # Join all venues with double newline separator
+            final_text = "\n\n".join(all_venue_texts)
+            
+            st.text_area("Copy Text", final_text, height=250)
