@@ -1054,7 +1054,7 @@ elif st.session_state.page == "touring":
             display_df = df.reset_index(drop=True)
             
         st.markdown("### Scraped Shows")
-        st.caption("Select rows to generate venue schedule text (hold Ctrl/Cmd for multiple).")
+        st.caption("Select rows to generate venue schedule text.")
 
         # Interactive Table
         event = st.dataframe(
