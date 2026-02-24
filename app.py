@@ -368,138 +368,165 @@ def transform_pricing_to_rows(scraped_data):
 
 def format_pricing_with_ai(transformed_data, scraped_data=None):
     """
-    Use OpenAI to categorize pricing data into standard tiers.
-    Returns the transformed data with AI-processed pricing tiers as a DataFrame.
+    Use OpenAI to categorize section names into standard tiers, then compute
+    per-date min/max price ranges from the raw scraped data.
     """
     if not transformed_data:
         return None, None, "No data to process"
-    
-    # Build price map from raw scraped data to preserve duplicate section names
-    # (e.g. multiple "Premium" tiers at different prices)
-    all_prices = {}
-    if scraped_data:
-        for item in scraped_data:
-            description = item.get('description', '').strip()
-            price = item.get('price', '')
-            if description:
-                normalized_price = normalize_price_display(price)
-                sections = [s.strip() for s in description.split('/')] if '/' in description else [description]
-                for section in sections:
-                    if section:
-                        if section not in all_prices:
-                            all_prices[section] = set()
-                        all_prices[section].add(normalized_price)
-    else:
-        exclude_keys = {"event_date", "event_time", "time"}
-        for row in transformed_data:
-            for key, value in row.items():
-                if key not in exclude_keys:
-                    if key not in all_prices:
-                        all_prices[key] = set()
-                    all_prices[key].add(value)
-    
-    # Format for the prompt
-    price_text_lines = []
-    for desc, prices in all_prices.items():
-        prices_str = ", ".join(sorted(prices))
-        price_text_lines.append(f"{desc}: {prices_str}")
-    
-    price_text = "\n".join(price_text_lines)
+    if not scraped_data:
+        return None, None, "No raw scraped data available"
 
-    print("price_text: ", price_text)
-    
-    prompt = f"""Look at these prices for a broadway show:
+    # Collect all unique section names (skip Student)
+    all_sections = set()
+    for item in scraped_data:
+        desc = item.get('description', '').strip()
+        if desc:
+            sections = [s.strip() for s in desc.split('/')] if '/' in desc else [desc]
+            for s in sections:
+                if s and s.lower() != 'student':
+                    all_sections.add(s)
 
-{price_text}
+    sections_list = "\n".join(sorted(all_sections))
 
-Please convert this text into json in this exact format:
+    prompt = f"""Here are the seating section names for a Broadway show:
 
+{sections_list}
+
+Categorize each section name into exactly one of these tiers:
+- Premium
+- MidPremium
+- Orchestra
+- FrontMezzanine
+- RearMezzanine
+
+Return a JSON object mapping each tier to the list of section names that belong to it.
+If a tier has no matching sections, set its value to null.
+
+Example:
 {{
-  "Premium": [
-    "lowest premium price",
-    "highest premium price"
-  ],
-  "MidPremium": [
-    "lowest mid premium price",
-    "highest mid premium price"
-  ],
-  "Orchestra": [
-    "lowest orchestra price",
-    "highest orchestra price"
-  ],
-  "FrontMezzanine": [
-    "lowest front mezzanine price",
-    "highest front mezzanine price"
-  ],
-  "RearMezzanine": [
-    "lowest rear mezzanine price",
-    "highest rear mezzanine price"
-  ]
+  "Premium": ["Premium"],
+  "MidPremium": null,
+  "Orchestra": ["Orchestra Rows AA-N", "Orchestra Center Rows L-N, Side Rows L-N"],
+  "FrontMezzanine": ["Mezzanine Rows A-D", "Mezzanine Center Rows A-D"],
+  "RearMezzanine": ["Mezzanine Rows G-K", "Mezzanine Rows H-K"]
 }}
-
-NOTE: Sometimes there will not be a mid premium tier - in that case output null for the midpremium values. All other fields are required.
-Skip any "Student" rates in the original text, and anything that cannot be put into the JSON categories.
 
 Return ONLY the JSON, no other text."""
 
     try:
         client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-        
+
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
-        
+
         ai_response = response.choices[0].message.content.strip()
-        
-        # Clean up the response (remove markdown code blocks if present)
+
         if ai_response.startswith("```"):
             ai_response = re.sub(r'^```json?\s*', '', ai_response)
             ai_response = re.sub(r'\s*```$', '', ai_response)
-        
-        # Parse the JSON response
-        pricing_tiers = json.loads(ai_response)
-        
-        # Process pricing tiers: extract numeric values, multiply highest by 1.04, round to nearest dollar
-        processed_tiers = {}
-        for tier, prices in pricing_tiers.items():
-            if prices and len(prices) >= 2:
-                # Extract numeric values (remove $ and any non-numeric chars)
-                price1 = int(round(extract_price_value(prices[0])))
-                price2_raw = extract_price_value(prices[1])
-                # Multiply by 1.04 and round to nearest dollar
-                price2 = int(round(price2_raw * 1.04))
-                processed_tiers[tier] = (price1, price2)
-        
-        # Map tier names to reg_tier columns
-        # Order: Premium, MidPremium (optional), Orchestra, FrontMezzanine, RearMezzanine
+
+        tier_mapping = json.loads(ai_response)
+
+        print("tier_mapping: ", json.dumps(tier_mapping, indent=2))
+
+        # Reverse mapping: section_name -> tier_name
+        section_to_tier = {}
+        for tier_name, sections in tier_mapping.items():
+            if sections:
+                for section_name in sections:
+                    section_to_tier[section_name] = tier_name
+
+        # Group scraped_data by dateTime
+        date_groups = {}
+        for item in scraped_data:
+            dt = item.get('dateTime', 'Unknown')
+            if dt not in date_groups:
+                date_groups[dt] = []
+            date_groups[dt].append(item)
+
         tier_order = ["Premium", "MidPremium", "Orchestra", "FrontMezzanine", "RearMezzanine"]
-        
-        # Create output rows for DataFrame
+
         result_rows = []
-        for row in transformed_data:
-            new_row = {
-                "event_date": row.get("event_date", ""),
-                "event_time": row.get("event_time", ""),
-                "time": row.get("time", "")
-            }
-            
-            # Assign tiers to fixed columns: 1=Premium, 2=MidPremium, 3=Orchestra, 4=FrontMezz, 5=RearMezz
+        for date_time, items in date_groups.items():
+            row = {}
+
+            # Parse dateTime (same logic as transform_pricing_to_rows)
+            m = re.match(r"^\s*([A-Za-z]+),\s*(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2}\s*[APMapm]{2})\s*$", date_time)
+            if m:
+                date_part = m.group(2)
+                time_part = m.group(3).upper().replace(" ", "")
+                try:
+                    parts = date_part.split('/')
+                    month_num = int(parts[0])
+                    day_num = int(parts[1])
+                    year = parts[2]
+                    month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                    formatted_date = f"{month_names[month_num]} {day_num}, {year}"
+                except Exception:
+                    formatted_date = date_part
+                time_formatted = time_part[:-2] + " " + time_part[-2:]
+                try:
+                    hour = int(time_part.split(':')[0])
+                    is_pm = 'PM' in time_part.upper()
+                    if is_pm and hour != 12:
+                        hour += 12
+                    elif not is_pm and hour == 12:
+                        hour = 0
+                    event_time = "matinee" if hour < 17 else "evening"
+                except Exception:
+                    event_time = "unknown"
+                row["event_date"] = formatted_date
+                row["event_time"] = event_time
+                row["time"] = time_formatted
+            else:
+                row["event_date"] = date_time
+                row["event_time"] = "unknown"
+                row["time"] = ""
+
+            # Collect prices per tier for THIS date only
+            tier_prices = {tier: [] for tier in tier_order}
+            for item in items:
+                desc = item.get('description', '').strip()
+                price = item.get('price', '')
+                if not desc:
+                    continue
+                sections = [s.strip() for s in desc.split('/')] if '/' in desc else [desc]
+                for section in sections:
+                    tier = section_to_tier.get(section)
+                    if tier:
+                        price_val = extract_price_value(price)
+                        if price_val > 0:
+                            tier_prices[tier].append(price_val)
+
+            # Build tier columns with per-date min/max
             for tier_num, tier_name in enumerate(tier_order, start=1):
-                if tier_name in processed_tiers:
-                    p1, p2 = processed_tiers[tier_name]
-                    new_row[f"reg_tier_{tier_num}"] = f"${p1} - ${p2}"
+                prices = tier_prices[tier_name]
+                if prices:
+                    min_price = int(round(min(prices)))
+                    max_price = int(round(max(prices) * 1.04))
+                    row[f"reg_tier_{tier_num}"] = f"${min_price} - ${max_price}"
                 else:
-                    new_row[f"reg_tier_{tier_num}"] = "null"
-            
-            result_rows.append(new_row)
-        
-        # Create DataFrame
+                    row[f"reg_tier_{tier_num}"] = "null"
+
+            result_rows.append(row)
+
+        # Sort by date then time
+        def parse_event_date(r):
+            try:
+                return datetime.strptime(r.get('event_date', ''), "%b %d, %Y")
+            except Exception:
+                return datetime.max
+
+        result_rows.sort(key=lambda r: (parse_event_date(r), r.get('time', '')))
+
         result_df = pd.DataFrame(result_rows)
-        
-        return result_df, processed_tiers, None
-        
+
+        return result_df, tier_mapping, None
+
     except json.JSONDecodeError as e:
         return None, None, f"Failed to parse AI response as JSON: {e}"
     except Exception as e:
