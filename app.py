@@ -333,20 +333,24 @@ def transform_pricing_to_rows(scraped_data):
             row["event_time"] = "unknown"
             row["time"] = ""
         
-        # Collect prices with their descriptions, splitting on "/" 
+        # Collect prices with their descriptions, splitting on "/"
+        # Use disambiguation suffixes when the same section name appears with different prices
         for item in items:
             price_str = item.get('price', '')
             description = item.get('description', '').strip()
             if description:
                 normalized_price = normalize_price_display(price_str)
-                # Split descriptions with "/" into separate entries with same price
-                if '/' in description:
-                    sections = [section.strip() for section in description.split('/')]
-                    for section in sections:
-                        if section:  # Skip empty sections
-                            row[section] = normalized_price
-                else:
-                    row[description] = normalized_price
+                sections = [section.strip() for section in description.split('/')] if '/' in description else [description]
+                for section in sections:
+                    if not section:
+                        continue
+                    key = section
+                    if key in row and row[key] != normalized_price:
+                        counter = 2
+                        while f"{section} ({counter})" in row:
+                            counter += 1
+                        key = f"{section} ({counter})"
+                    row[key] = normalized_price
         
         result.append(row)
     
@@ -362,7 +366,7 @@ def transform_pricing_to_rows(scraped_data):
     
     return result
 
-def format_pricing_with_ai(transformed_data):
+def format_pricing_with_ai(transformed_data, scraped_data=None):
     """
     Use OpenAI to categorize pricing data into standard tiers.
     Returns the transformed data with AI-processed pricing tiers as a DataFrame.
@@ -370,18 +374,29 @@ def format_pricing_with_ai(transformed_data):
     if not transformed_data:
         return None, None, "No data to process"
     
-    # Extract only the description/price pairs (exclude date, event_time, time)
-    exclude_keys = {"event_date", "event_time", "time"}
-    
-    # Collect all unique description:price pairs across all date/times
+    # Build price map from raw scraped data to preserve duplicate section names
+    # (e.g. multiple "Premium" tiers at different prices)
     all_prices = {}
-    for row in transformed_data:
-        for key, value in row.items():
-            if key not in exclude_keys:
-                # Track all prices for each description
-                if key not in all_prices:
-                    all_prices[key] = set()
-                all_prices[key].add(value)
+    if scraped_data:
+        for item in scraped_data:
+            description = item.get('description', '').strip()
+            price = item.get('price', '')
+            if description:
+                normalized_price = normalize_price_display(price)
+                sections = [s.strip() for s in description.split('/')] if '/' in description else [description]
+                for section in sections:
+                    if section:
+                        if section not in all_prices:
+                            all_prices[section] = set()
+                        all_prices[section].add(normalized_price)
+    else:
+        exclude_keys = {"event_date", "event_time", "time"}
+        for row in transformed_data:
+            for key, value in row.items():
+                if key not in exclude_keys:
+                    if key not in all_prices:
+                        all_prices[key] = set()
+                    all_prices[key].add(value)
     
     # Format for the prompt
     price_text_lines = []
@@ -390,6 +405,8 @@ def format_pricing_with_ai(transformed_data):
         price_text_lines.append(f"{desc}: {prices_str}")
     
     price_text = "\n".join(price_text_lines)
+
+    print("price_text: ", price_text)
     
     prompt = f"""Look at these prices for a broadway show:
 
@@ -420,7 +437,7 @@ Please convert this text into json in this exact format:
   ]
 }}
 
-NOTE: Sometimes there will not be a mid premium tier - in that case do not output anything for midpremium in your final json. All other fields are required.
+NOTE: Sometimes there will not be a mid premium tier - in that case output null for the midpremium values. All other fields are required.
 Skip any "Student" rates in the original text, and anything that cannot be put into the JSON categories.
 
 Return ONLY the JSON, no other text."""
@@ -447,7 +464,7 @@ Return ONLY the JSON, no other text."""
         # Process pricing tiers: extract numeric values, multiply highest by 1.04, round to nearest dollar
         processed_tiers = {}
         for tier, prices in pricing_tiers.items():
-            if len(prices) >= 2:
+            if prices and len(prices) >= 2:
                 # Extract numeric values (remove $ and any non-numeric chars)
                 price1 = int(round(extract_price_value(prices[0])))
                 price2_raw = extract_price_value(prices[1])
@@ -468,13 +485,13 @@ Return ONLY the JSON, no other text."""
                 "time": row.get("time", "")
             }
             
-            # Assign tiers to reg_tier_1 through reg_tier_5
-            tier_num = 1
-            for tier_name in tier_order:
+            # Assign tiers to fixed columns: 1=Premium, 2=MidPremium, 3=Orchestra, 4=FrontMezz, 5=RearMezz
+            for tier_num, tier_name in enumerate(tier_order, start=1):
                 if tier_name in processed_tiers:
                     p1, p2 = processed_tiers[tier_name]
                     new_row[f"reg_tier_{tier_num}"] = f"${p1} - ${p2}"
-                    tier_num += 1
+                else:
+                    new_row[f"reg_tier_{tier_num}"] = "null"
             
             result_rows.append(new_row)
         
@@ -964,7 +981,7 @@ if st.session_state.page == "pricing":
                         
                         if format_clicked:
                             with st.spinner("Processing with AI..."):
-                                result_df, pricing_tiers, error = format_pricing_with_ai(transformed_data)
+                                result_df, pricing_tiers, error = format_pricing_with_ai(transformed_data, scraped_data)
                                 if error:
                                     st.error(error)
                                 else:
