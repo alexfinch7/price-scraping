@@ -405,11 +405,13 @@ If a tier has no matching sections, set its value to null.
 Example:
 {{
   "Premium": ["Premium"],
-  "MidPremium": null,
+  "MidPremium": ["Mid Premium"],
   "Orchestra": ["Orchestra Rows AA-N", "Orchestra Center Rows L-N, Side Rows L-N"],
   "FrontMezzanine": ["Mezzanine Rows A-D", "Mezzanine Center Rows A-D"],
   "RearMezzanine": ["Mezzanine Rows G-K", "Mezzanine Rows H-K"]
 }}
+
+NOTE: Mid Premium and Premium are separate tiers. Sometimes there will not be a mid premium tier - in that case set the MidPremium value to null.
 
 Return ONLY the JSON, no other text."""
 
@@ -593,16 +595,17 @@ def format_pricing_by_date(scraped_data, show_title=None):
         # Helper to categorize by seating area for grouping
         def _categorize(section_text: str):
             t = (section_text or "").lower()
-            # Premium tier first
-            if "premium" in t or "mid-premium" in t or "mid premium" in t:
+            if "mid-premium" in t or "mid premium" in t:
+                return ("mid-premium", 1)
+            if "premium" in t:
                 return ("premium", 0)
             if "orchestra" in t or "orch" in t:
-                return ("orchestra", 1)
+                return ("orchestra", 2)
             if "mezzanine" in t or "mezz" in t:
-                return ("mezzanine", 2)
+                return ("mezzanine", 3)
             if "balcony" in t or "balc" in t:
-                return ("balcony", 3)
-            return ("other", 4)
+                return ("balcony", 4)
+            return ("other", 5)
         
         # Format the pricing items
         for item in items:
