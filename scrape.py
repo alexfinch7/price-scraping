@@ -218,34 +218,81 @@ def scrape_pricing(url: str, from_date: str, to_date: str) -> dict:
             browser.close()
             return result
 
-        # 3b) Fill the date range picked by the user. The inputs are readonly, so we drop that attribute and
-        #      set the value via JavaScript then dispatch the appropriate events so Knockout/Bootstrap recognise
-        #      the change.
+        # 3a.5) Dismiss the floating drawer if visible — it can overlay the pricing grid
+        try:
+            drawer = page.query_selector("#floating-drawer.floating-drawer--visible")
+            if drawer:
+                close_btn = page.query_selector("#floating-drawer .drawer-top-btn")
+                if close_btn and close_btn.is_visible():
+                    close_btn.click()
+                    page.wait_for_timeout(500)
+                else:
+                    page.evaluate("""() => {
+                        const d = document.querySelector('#floating-drawer');
+                        if (d) d.classList.remove('floating-drawer--visible');
+                    }""")
+                    page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        # 3b) Fill the date range picked by the user.
+        #     We use the Bootstrap datepicker API (via jQuery) so that the 'changeDate' event
+        #     fires and Knockout observables update, triggering the server-side data fetch.
+        #     Falls back to direct DOM manipulation if jQuery/datepicker aren't available.
 
         def _set_date_input(selector: str, value: str):
-            # Playwright's evaluate allows only one extra argument, so we pass an object { sel, val }
             page.evaluate(
-                "({ sel, val }) => {\n"  # JS function receiving an object
-                "  const el = document.querySelector(sel);\n"
-                "  if (!el) return;\n"
-                "  el.removeAttribute('readonly');\n"
-                "  el.value = val;\n"
-                "  el.dispatchEvent(new Event('input', { bubbles: true }));\n"
-                "  el.dispatchEvent(new Event('change', { bubbles: true }));\n"
-                "}",
+                """({ sel, val }) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return;
+
+                    // Try Bootstrap datepicker API via jQuery first
+                    if (typeof jQuery !== 'undefined') {
+                        const $el = jQuery(el);
+                        if (typeof $el.datepicker === 'function') {
+                            $el.datepicker('setDate', val);
+                            $el.trigger('changeDate');
+                            $el.trigger('change');
+                            return;
+                        }
+                    }
+
+                    // Fallback: direct value set with comprehensive event dispatch
+                    el.removeAttribute('readonly');
+                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    ).set;
+                    nativeSetter.call(el, val);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }""",
                 {"sel": selector, "val": value},
             )
 
         _set_date_input("#pricing-grid input#fromDate", from_date)
+        page.wait_for_timeout(500)
         _set_date_input("#pricing-grid input#toDate", to_date)
 
-        # Give the page a moment for any data reload after date change
-        page.wait_for_timeout(1500)
+        # Give the page time for the AJAX data reload after date change
+        page.wait_for_timeout(3000)
 
-        # 3c) Now wait until at least one product row is visible
-        try:
-            page.wait_for_selector("#pricing-grid .product-data-column.product-section span", timeout=5000)
-        except:
+        # 3c) Wait for product rows with retries — large date ranges can take longer
+        product_row_sel = "#pricing-grid .product-data-column.product-section span"
+        rows_found = False
+        for attempt in range(3):
+            try:
+                page.wait_for_selector(product_row_sel, timeout=8000)
+                rows_found = True
+                break
+            except Exception:
+                if attempt < 2:
+                    # Re-trigger the date inputs in case the first set didn't take
+                    _set_date_input("#pricing-grid input#fromDate", from_date)
+                    page.wait_for_timeout(300)
+                    _set_date_input("#pricing-grid input#toDate", to_date)
+                    page.wait_for_timeout(3000)
+
+        if not rows_found:
             if not page.query_selector("#pricing-grid"):
                 result["error"] = "Could not find the element with id 'pricing-grid' after setting dates."
             else:
