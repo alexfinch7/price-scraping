@@ -1,9 +1,82 @@
 import asyncio
 import argparse
+import re
+from datetime import datetime
 from playwright.async_api import async_playwright
 import pandas as pd
 import sys
 import os
+
+MONTH_MAP = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
+    'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'sept': 9,
+    'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+def _parse_single_date(s, default_year=2026):
+    """Parse a single date like 'April 7', 'Feb 1, 2026', 'Dec 11, 2025'."""
+    s = s.strip().rstrip(',')
+    # Month Day, Year
+    m = re.match(r'([A-Za-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})', s)
+    if m:
+        month = MONTH_MAP.get(m.group(1).lower())
+        if month:
+            return datetime(int(m.group(3)), month, int(m.group(2)))
+    # Month Day (no year)
+    m = re.match(r'([A-Za-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?', s)
+    if m:
+        month = MONTH_MAP.get(m.group(1).lower())
+        if month:
+            return datetime(default_year, month, int(m.group(2)))
+    return None
+
+def standardize_date_range(raw, default_year=2026):
+    """
+    Parse a raw date range string into (start_mm_dd_yyyy, end_mm_dd_yyyy).
+
+    Handles formats like:
+      "January 28–February 7, 2026"  →  ("01/28/2026", "02/07/2026")
+      "April 7-12, 2026"             →  ("04/07/2026", "04/12/2026")
+      "May 26 - May 31"              →  ("05/26/2026", "05/31/2026")
+      "April 19, 2026"               →  ("04/19/2026", "04/19/2026")
+    """
+    if not raw or not isinstance(raw, str):
+        return "", ""
+
+    s = raw.strip()
+    # Normalize en-dash / em-dash to hyphen
+    s = s.replace('\u2013', '-').replace('\u2014', '-')
+
+    # Extract trailing year if present (e.g. "April 7-12, 2026")
+    year_match = re.search(r',?\s*(\d{4})\s*$', s)
+    trailing_year = int(year_match.group(1)) if year_match else default_year
+    if year_match:
+        s = s[:year_match.start()].strip()
+
+    # Split on hyphen (with optional surrounding spaces), max 1 split
+    parts = re.split(r'\s*-\s*', s, maxsplit=1)
+
+    fmt = lambda d: d.strftime("%m/%d/%Y") if d else ""
+
+    if len(parts) == 2:
+        start_str = parts[0].strip()
+        end_str = parts[1].strip()
+
+        start_date = _parse_single_date(start_str, trailing_year)
+
+        if re.match(r'^\d{1,2}$', end_str) and start_date:
+            end_date = datetime(trailing_year, start_date.month, int(end_str))
+        else:
+            end_date = _parse_single_date(end_str, trailing_year)
+
+        return fmt(start_date), fmt(end_date)
+
+    # Single date
+    d = _parse_single_date(s, trailing_year)
+    return fmt(d), fmt(d)
 
 async def get_browser_context(p):
     # Launch browser with options to appear less bot-like
@@ -17,80 +90,140 @@ async def get_browser_context(p):
     )
     return browser, context
 
+def split_location(location_str):
+    """Split 'City, ST' into (city, state). Handles 'City, ST', 'City, Canada', etc."""
+    if not location_str or not isinstance(location_str, str):
+        return "", ""
+    parts = [p.strip() for p in location_str.split(",", 1)]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return parts[0], ""
+
 async def get_tourstoyou_data():
     url = "https://tourstoyou.org/"
-    
+
     print(f"Starting scrape of {url}...")
-    
-    data_rows = []
-    headers = []
+
+    all_data = []
+    headers = ["SHOW", "CITY", "STATE", "VENUE", "START_DATE", "END_DATE", "TICKETS"]
 
     async with async_playwright() as p:
         browser, context = await get_browser_context(p)
         page = await context.new_page()
-        
+
         try:
-            # Go to website
             await page.goto(url, timeout=60000)
             print("Page loaded.")
 
-            # Click "Now Playing" tab
-            tab_selector = "#elementor-tab-title-1122"
-            try:
-                await page.wait_for_selector(tab_selector, state="visible", timeout=10000)
-                await page.click(tab_selector)
-                print("Clicked 'Now Playing' tab.")
-            except Exception as e:
-                print(f"Could not find tab by ID. Trying by text 'Now Playing'. Error: {e}")
-                await page.get_by_text("Now Playing", exact=True).click()
-                print("Clicked 'Now Playing' tab by text.")
+            # Click the "Shows" tab instead of "Now Playing"
+            clicked = False
+            tabs = page.locator("[id^='elementor-tab-title-']")
+            tab_count = await tabs.count()
+            for i in range(tab_count):
+                tab = tabs.nth(i)
+                text = (await tab.inner_text()).strip()
+                if text.lower() == "shows":
+                    await tab.click()
+                    clicked = True
+                    print(f"Clicked 'Shows' tab.")
+                    break
 
-            # Select "100" entries
-            select_selector = "#dt-length-0"
-            try:
-                await page.wait_for_selector(select_selector, state="visible", timeout=10000)
-                await page.select_option(select_selector, value="100")
-                print("Set entries to 100.")
-            except Exception as e:
-                 print(f"Could not select 100 entries. Continuing with default. Error: {e}")
+            if not clicked:
+                await page.get_by_role("tab", name="Shows").click()
+                print("Clicked 'Shows' tab via role selector.")
 
-            # Wait for table to update/load
-            await page.wait_for_timeout(3000) 
+            await page.wait_for_timeout(3000)
 
-            # Scrape table data
-            table_selector = "#tablepress-863"
-            await page.wait_for_selector(table_selector)
-            
-            # Extract headers
-            headers = await page.locator(f"{table_selector} thead th").all_inner_texts()
-            # Clean headers
-            headers = [h.strip().upper() for h in headers]
-            print(f"Found headers: {headers}")
-            
-            # Extract rows
-            rows = await page.locator(f"{table_selector} tbody tr").all()
-            
-            for row in rows:
-                cells = await row.locator("td").all()
-                row_data = []
-                for i, cell in enumerate(cells):
-                    # For the last column (Tickets), try to get the link
-                    if i == 4: # Assuming 5th column is Tickets based on previous run
-                        link_element = cell.locator("a").first
-                        if await link_element.count() > 0:
-                            href = await link_element.get_attribute("href")
-                            row_data.append(href)
-                        else:
-                            text = await cell.inner_text()
-                            row_data.append(text.strip())
-                    else:
-                        text = await cell.inner_text()
-                        row_data.append(text.strip())
-                
-                if row_data:
-                    data_rows.append(row_data)
-            
-            print(f"Scraped {len(data_rows)} rows.")
+            # Collect all show links from the visible tables
+            show_links = await page.evaluate("""() => {
+                const links = [];
+                const seen = new Set();
+                const anchors = document.querySelectorAll('a[href*="/shows/"]');
+                for (const a of anchors) {
+                    const href = a.href;
+                    const text = a.innerText.trim();
+                    if (!href || !text) continue;
+                    if (href.match(/tourstoyou\\.org\\/shows\\/[^/]+/) && !seen.has(href)) {
+                        seen.add(href);
+                        links.push({name: text, url: href});
+                    }
+                }
+                return links;
+            }""")
+
+            print(f"Found {len(show_links)} show links.")
+
+            # Visit each show page and scrape schedule tables
+            for i, show in enumerate(show_links):
+                print(f"[{i+1}/{len(show_links)}] Scraping {show['name']}...")
+                try:
+                    await page.goto(show['url'], timeout=30000)
+                    await page.wait_for_timeout(1500)
+
+                    rows = await page.evaluate("""() => {
+                        const data = [];
+                        const seen = new Set();
+                        const tables = document.querySelectorAll('table');
+                        for (const table of tables) {
+                            const thCells = table.querySelectorAll('thead th, tr:first-child th');
+                            const headerTexts = Array.from(thCells).map(
+                                th => th.innerText.trim().toLowerCase()
+                            );
+
+                            if (headerTexts.some(h => h.includes('season'))) continue;
+
+                            const locIdx = headerTexts.findIndex(h => h.includes('location'));
+                            const venIdx = headerTexts.findIndex(h => h.includes('venue'));
+                            const dateIdx = headerTexts.findIndex(h => h.includes('date'));
+                            const tickIdx = headerTexts.findIndex(h => h.includes('ticket'));
+
+                            if (locIdx === -1 || venIdx === -1 || dateIdx === -1) continue;
+
+                            const bodyRows = table.querySelectorAll('tbody tr');
+                            for (const row of bodyRows) {
+                                const cells = row.querySelectorAll('td');
+                                if (cells.length < 3) continue;
+
+                                const location = cells[locIdx]?.innerText?.trim() || '';
+                                const venue = cells[venIdx]?.innerText?.trim() || '';
+                                const dates = cells[dateIdx]?.innerText?.trim() || '';
+                                let tickets = '';
+                                if (tickIdx !== -1 && cells[tickIdx]) {
+                                    const link = cells[tickIdx].querySelector('a');
+                                    tickets = link ? link.href : cells[tickIdx].innerText.trim();
+                                }
+                                if (!location && !venue && !dates) continue;
+                                const key = location + '|' + venue + '|' + dates;
+                                if (seen.has(key)) continue;
+                                seen.add(key);
+                                data.push({location, venue, dates, tickets});
+                            }
+                        }
+                        return data;
+                    }""")
+
+                    for row in rows:
+                        start_dt, end_dt = standardize_date_range(row['dates'])
+                        city, state = split_location(row['location'])
+                        all_data.append([
+                            show['name'],
+                            city,
+                            state,
+                            row['venue'],
+                            start_dt,
+                            end_dt,
+                            row['tickets']
+                        ])
+
+                    print(f"  Found {len(rows)} schedule entries.")
+
+                except Exception as e:
+                    print(f"  Error scraping {show['name']}: {e}")
+                    continue
+
+                await asyncio.sleep(0.5)
+
+            print(f"Total: {len(all_data)} rows from {len(show_links)} shows.")
 
         except Exception as e:
             print(f"An error occurred during tourstoyou scrape: {e}")
@@ -98,8 +231,8 @@ async def get_tourstoyou_data():
             traceback.print_exc()
         finally:
             await browser.close()
-            
-    return headers, data_rows
+
+    return headers, all_data
 
 async def get_broadway_data():
     base_url = "https://www.broadway.org"
@@ -108,7 +241,7 @@ async def get_broadway_data():
     print(f"Starting scrape of {list_url}...")
     
     all_data = []
-    headers = ["SHOW", "LOCATION", "VENUE", "DATES", "TICKETS"]
+    headers = ["SHOW", "CITY", "STATE", "VENUE", "START_DATE", "END_DATE", "TICKETS"]
     
     async with async_playwright() as p:
         browser, context = await get_browser_context(p)
@@ -190,8 +323,9 @@ async def get_broadway_data():
                         venue = venue.strip()
                         dates = dates.strip()
                         
-                        # Format: SHOW,LOCATION,VENUE,DATES,TICKETS
-                        all_data.append([show['name'], location, venue, dates, ticket_link])
+                        start_dt, end_dt = standardize_date_range(dates)
+                        city, state = split_location(location)
+                        all_data.append([show['name'], city, state, venue, start_dt, end_dt, ticket_link])
                         
                 except Exception as e:
                     print(f"  Error scraping {show['name']}: {e}")

@@ -7,8 +7,9 @@ import pandas as pd
 from datetime import datetime, date
 from openai import OpenAI
 
+from rapidfuzz import fuzz
 from scrape import scrape_pricing, get_broadway_shows
-from scrape_shows import get_tourstoyou_data, get_broadway_data
+from scrape_shows import get_tourstoyou_data, get_broadway_data, split_location, standardize_date_range
 
 st.set_page_config(page_title="Broadway Scraper Suite", layout="wide")
 
@@ -87,8 +88,9 @@ def get_supabase():
 def save_cache_to_supabase(df):
     """Save touring shows to Supabase"""
     supabase = get_supabase()
+    records = json.loads(df.to_json(orient='records'))
     cache_data = {
-        'shows': df.to_dict(orient='records'),
+        'shows': records,
         'last_scraped': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     try:
@@ -697,39 +699,164 @@ def run_all_tasks():
 # Helper Functions - Touring Search
 # ------------------------------------------------------------------
 
+def load_venue_registry():
+    """Load venue registry from Supabase into a DataFrame."""
+    try:
+        supabase = get_supabase()
+        response = supabase.table('venue_registry').select('*').execute()
+        if response.data:
+            return pd.DataFrame(response.data)
+    except Exception as e:
+        st.warning(f"Could not load venue registry: {e}")
+    return pd.DataFrame(columns=['id', 'city', 'state', 'venue_name', 'address'])
+
+def match_venue(scraped_city, scraped_venue, registry_df, threshold=65):
+    """
+    Fuzzy-match a scraped venue against the registry, scoped by city.
+    Returns (venue_id, canonical_venue_name, address) or (None, None, None).
+    """
+    if registry_df.empty or not scraped_city:
+        return None, None, None
+
+    scraped_city_lower = scraped_city.strip().lower()
+
+    city_candidates = registry_df[
+        registry_df['city'].str.strip().str.lower() == scraped_city_lower
+    ]
+
+    if city_candidates.empty:
+        city_candidates = registry_df[
+            registry_df['city'].str.strip().str.lower().apply(
+                lambda c: fuzz.ratio(c, scraped_city_lower)
+            ) >= 80
+        ]
+
+    if city_candidates.empty:
+        return None, None, None
+
+    scraped_venue_clean = scraped_venue.strip()
+    best_score = 0
+    best_row = None
+
+    for _, row in city_candidates.iterrows():
+        score = fuzz.token_sort_ratio(
+            scraped_venue_clean.lower(),
+            row['venue_name'].strip().lower()
+        )
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    if best_score >= threshold and best_row is not None:
+        return int(best_row['id']), best_row['venue_name'], best_row['address']
+
+    return None, None, None
+
+def match_and_dedup(df):
+    """
+    Post-scrape processing: match venues to registry and deduplicate across sources.
+    Expects columns: SHOW, CITY, STATE, VENUE, START_DATE, END_DATE, TICKETS
+    Returns DataFrame with added: VENUE_ID, CANONICAL_VENUE, ADDRESS (deduped).
+    """
+    registry_df = load_venue_registry()
+
+    venue_ids = []
+    canonical_names = []
+    addresses = []
+
+    for _, row in df.iterrows():
+        vid, cname, addr = match_venue(
+            str(row.get('CITY', '')),
+            str(row.get('VENUE', '')),
+            registry_df
+        )
+        venue_ids.append(vid)
+        canonical_names.append(cname or row.get('VENUE', ''))
+        addresses.append(addr or '')
+
+    df = df.copy()
+    df['VENUE_ID'] = venue_ids
+    df['CANONICAL_VENUE'] = canonical_names
+    df['ADDRESS'] = addresses
+
+    # Deduplicate: same show (fuzzy) + same venue_id + overlapping dates
+    keep = [True] * len(df)
+    show_norm = df['SHOW'].str.strip().str.lower().tolist()
+    starts = pd.to_datetime(df['START_DATE'], format='%m/%d/%Y', errors='coerce')
+    ends = pd.to_datetime(df['END_DATE'], format='%m/%d/%Y', errors='coerce')
+
+    for i in range(len(df)):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, len(df)):
+            if not keep[j]:
+                continue
+
+            vid_i = df.iloc[i]['VENUE_ID']
+            vid_j = df.iloc[j]['VENUE_ID']
+
+            # Both must have a venue_id match, and they must be the same venue
+            if pd.isna(vid_i) or pd.isna(vid_j) or vid_i != vid_j:
+                continue
+
+            # Fuzzy show name match
+            if fuzz.token_sort_ratio(show_norm[i], show_norm[j]) < 85:
+                continue
+
+            # Date overlap check (with 3-day tolerance)
+            tolerance = pd.Timedelta(days=3)
+            s_i, e_i = starts.iloc[i], ends.iloc[i]
+            s_j, e_j = starts.iloc[j], ends.iloc[j]
+
+            if pd.isna(s_i) or pd.isna(s_j):
+                continue
+
+            if s_i - tolerance <= e_j and s_j - tolerance <= e_i:
+                # Keep the row that has a ticket link, prefer first source
+                if df.iloc[j]['TICKETS'] and not df.iloc[i]['TICKETS']:
+                    keep[i] = False
+                else:
+                    keep[j] = False
+
+    result = df[keep].reset_index(drop=True)
+    dropped = len(df) - len(result)
+    if dropped:
+        print(f"Dedup: removed {dropped} duplicate rows.")
+
+    return result
+
 async def scrape_all_touring():
+    EMPTY_COLS = ["SHOW", "CITY", "STATE", "VENUE", "START_DATE", "END_DATE", "TICKETS"]
+
     with st.status("Scraping shows...", expanded=True) as status:
         st.write("Scraping tourstoyou.org...")
         headers1, data1 = await get_tourstoyou_data()
-        st.write(f"Found {len(data1)} shows from tourstoyou.org")
-        
+        st.write(f"Found {len(data1)} rows from tourstoyou.org")
+
         st.write("Scraping broadway.org...")
         headers2, data2 = await get_broadway_data()
-        st.write(f"Found {len(data2)} shows from broadway.org")
-        
-        # Combine
-        if data1:
-            df1 = pd.DataFrame(data1, columns=headers1)
-        else:
-            df1 = pd.DataFrame(columns=["SHOW", "LOCATION", "VENUE", "DATES", "TICKETS"])
+        st.write(f"Found {len(data2)} rows from broadway.org")
 
-        if data2:
-            df2 = pd.DataFrame(data2, columns=headers2)
-        else:
-            df2 = pd.DataFrame(columns=["SHOW", "LOCATION", "VENUE", "DATES", "TICKETS"])
-        
-        # Ensure columns match and are upper case
+        df1 = pd.DataFrame(data1, columns=headers1) if data1 else pd.DataFrame(columns=EMPTY_COLS)
+        df2 = pd.DataFrame(data2, columns=headers2) if data2 else pd.DataFrame(columns=EMPTY_COLS)
+
         df1.columns = [c.upper() for c in df1.columns]
         df2.columns = [c.upper() for c in df2.columns]
-        
+
         combined = pd.concat([df1, df2], ignore_index=True)
+
+        st.write("Matching venues & deduplicating...")
+        combined = match_and_dedup(combined)
+
         st.session_state.shows_df = combined
-        
-        # Save to Supabase
+
         st.write("Saving to Supabase...")
         st.session_state.shows_last_scraped = save_cache_to_supabase(combined)
-        
-        status.update(label=f"Scraping complete! Found {len(combined)} shows.", state="complete", expanded=False)
+
+        status.update(
+            label=f"Scraping complete! {len(combined)} shows after dedup.",
+            state="complete", expanded=False
+        )
 
 def normalize_date_year(date_str, default_year="2026"):
     """Add year to date string if it doesn't end with a 4-digit year"""
@@ -1070,6 +1197,32 @@ elif st.session_state.page == "touring":
         with st.spinner("Loading cached data..."):
             cached_df, last_scraped = load_cache_from_supabase()
         if cached_df is not None:
+            needs_save = False
+
+            # Migrate old format: split LOCATION → CITY + STATE
+            if 'LOCATION' in cached_df.columns and 'CITY' not in cached_df.columns:
+                splits = cached_df['LOCATION'].apply(split_location)
+                cached_df['CITY'] = splits.apply(lambda x: x[0])
+                cached_df['STATE'] = splits.apply(lambda x: x[1])
+                cached_df.drop(columns=['LOCATION'], inplace=True)
+                needs_save = True
+
+            # Migrate old format: split DATES → START_DATE + END_DATE
+            if 'DATES' in cached_df.columns and 'START_DATE' not in cached_df.columns:
+                parsed = cached_df['DATES'].apply(standardize_date_range)
+                cached_df['START_DATE'] = parsed.apply(lambda x: x[0])
+                cached_df['END_DATE'] = parsed.apply(lambda x: x[1])
+                cached_df.drop(columns=['DATES'], inplace=True)
+                needs_save = True
+
+            # Run venue matching + dedup if not yet applied
+            if 'VENUE_ID' not in cached_df.columns:
+                cached_df = match_and_dedup(cached_df)
+                needs_save = True
+
+            if needs_save:
+                save_cache_to_supabase(cached_df)
+
             st.session_state.shows_df = cached_df
             st.session_state.shows_last_scraped = last_scraped
 
@@ -1103,55 +1256,76 @@ elif st.session_state.page == "touring":
         st.markdown("### Scraped Shows")
         st.caption("Select rows to generate venue schedule text.")
 
-        # Interactive Table
+        # Choose which columns to show in the table
+        display_cols = [c for c in ["SHOW", "CITY", "STATE", "CANONICAL_VENUE", "START_DATE", "END_DATE", "ADDRESS", "TICKETS"]
+                        if c in display_df.columns]
+        show_df = display_df[display_cols] if display_cols else display_df
+
         event = st.dataframe(
-            display_df,
+            show_df,
             selection_mode="multi-row",
             on_select="rerun",
             use_container_width=True,
             hide_index=True
         )
-        
+
         if len(event.selection.rows) > 0:
-            # Collect unique venue/location pairs from selected rows
             selected_venues = []
             seen = set()
             for idx in event.selection.rows:
                 selected_row = display_df.iloc[idx]
-                venue = str(selected_row['VENUE']).strip()
-                location = str(selected_row['LOCATION']).strip()
-                key = (venue, location)
+                venue_id = selected_row.get('VENUE_ID')
+                city = str(selected_row.get('CITY', '')).strip()
+                state = str(selected_row.get('STATE', '')).strip()
+                venue = str(selected_row.get('CANONICAL_VENUE', selected_row.get('VENUE', ''))).strip()
+                address = str(selected_row.get('ADDRESS', '')).strip()
+
+                key = (venue_id, city) if pd.notna(venue_id) else (venue, city)
                 if key not in seen:
                     seen.add(key)
-                    selected_venues.append((venue, location))
-            
+                    selected_venues.append({
+                        'venue_id': venue_id, 'city': city, 'state': state,
+                        'venue': venue, 'address': address
+                    })
+
             st.subheader(f"Selected Venue Schedules ({len(selected_venues)})")
-            
+
             all_venue_texts = []
-            
-            for venue, location in selected_venues:
-                # Find all shows at this venue/location in the FULL dataframe
-                venue_shows = df[
-                    (df['VENUE'].astype(str).str.strip() == venue) & 
-                    (df['LOCATION'].astype(str).str.strip() == location)
-                ].copy()
-                
-                # Sort by date
-                venue_shows['start_date'] = venue_shows['DATES'].apply(parse_start_date)
-                venue_shows = venue_shows.sort_values('start_date', na_position='last')
-                
-                # Format text
-                header = f"{location} - {venue.upper()}"
+
+            for sv in selected_venues:
+                if pd.notna(sv['venue_id']):
+                    venue_shows = df[df['VENUE_ID'] == sv['venue_id']].copy()
+                else:
+                    v_col = 'CANONICAL_VENUE' if 'CANONICAL_VENUE' in df.columns else 'VENUE'
+                    venue_shows = df[
+                        (df[v_col].astype(str).str.strip() == sv['venue'])
+                        & (df['CITY'].astype(str).str.strip() == sv['city'])
+                    ].copy()
+
+                venue_shows['_sort_date'] = pd.to_datetime(
+                    venue_shows['START_DATE'], format='%m/%d/%Y', errors='coerce'
+                )
+                venue_shows = venue_shows.sort_values('_sort_date', na_position='last')
+
+                location_label = f"{sv['city']}, {sv['state']}" if sv['state'] else sv['city']
+                header = f"{location_label} - {sv['venue'].upper()}"
+                if sv['address']:
+                    header += f"\n{sv['address']}"
                 lines = [header]
-                
+
                 for _, row in venue_shows.iterrows():
-                    dates = normalize_date_year(row['DATES'])
+                    start = row.get('START_DATE', '')
+                    end = row.get('END_DATE', '')
+                    if start and end and start != end:
+                        dates = f"{start} - {end}"
+                    elif start:
+                        dates = start
+                    else:
+                        dates = ""
                     line = f"{row['SHOW']}: {dates}"
                     lines.append(line)
-                
+
                 all_venue_texts.append("\n".join(lines))
-            
-            # Join all venues with double newline separator
+
             final_text = "\n\n".join(all_venue_texts)
-            
             st.text_area("Copy Text", final_text, height=250)
