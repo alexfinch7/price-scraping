@@ -779,9 +779,16 @@ def match_and_dedup(df):
     df['CANONICAL_VENUE'] = canonical_names
     df['ADDRESS'] = addresses
 
-    # Deduplicate: same show (fuzzy) + same venue_id + overlapping dates
+    # Filter out past shows (END_DATE earlier than today)
+    today = pd.Timestamp.now().normalize()
+    end_dates = pd.to_datetime(df['END_DATE'], format='%m/%d/%Y', errors='coerce')
+    df = df[end_dates.isna() | (end_dates >= today)].reset_index(drop=True)
+
+    # Deduplicate: same show (fuzzy) + same venue + overlapping dates
     keep = [True] * len(df)
     show_norm = df['SHOW'].str.strip().str.lower().tolist()
+    venue_norm = df['CANONICAL_VENUE'].str.strip().str.lower().tolist()
+    cities = df['CITY'].str.strip().str.lower().tolist()
     starts = pd.to_datetime(df['START_DATE'], format='%m/%d/%Y', errors='coerce')
     ends = pd.to_datetime(df['END_DATE'], format='%m/%d/%Y', errors='coerce')
 
@@ -792,14 +799,19 @@ def match_and_dedup(df):
             if not keep[j]:
                 continue
 
+            # Check venue match: same VENUE_ID, or fuzzy venue name + same city
             vid_i = df.iloc[i]['VENUE_ID']
             vid_j = df.iloc[j]['VENUE_ID']
 
-            # Both must have a venue_id match, and they must be the same venue
-            if pd.isna(vid_i) or pd.isna(vid_j) or vid_i != vid_j:
+            same_venue = False
+            if pd.notna(vid_i) and pd.notna(vid_j) and vid_i == vid_j:
+                same_venue = True
+            elif cities[i] == cities[j] and fuzz.token_sort_ratio(venue_norm[i], venue_norm[j]) >= 80:
+                same_venue = True
+
+            if not same_venue:
                 continue
 
-            # Fuzzy show name match
             if fuzz.token_sort_ratio(show_norm[i], show_norm[j]) < 85:
                 continue
 
@@ -812,7 +824,6 @@ def match_and_dedup(df):
                 continue
 
             if s_i - tolerance <= e_j and s_j - tolerance <= e_i:
-                # Keep the row that has a ticket link, prefer first source
                 if df.iloc[j]['TICKETS'] and not df.iloc[i]['TICKETS']:
                     keep[i] = False
                 else:
