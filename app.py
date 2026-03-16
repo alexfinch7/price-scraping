@@ -752,6 +752,46 @@ def match_venue(scraped_city, scraped_venue, registry_df, threshold=65):
 
     return None, None, None
 
+
+def _normalize_show_for_dedup(name):
+    """Strip parentheticals and punctuation for dedup comparison."""
+    s = name.lower().strip()
+    s = re.sub(r'\s*\([^)]*\)\s*', ' ', s)
+    s = re.sub(r'[^\w\s]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def _shows_match(name_i, name_j):
+    """Check if two show names refer to the same show using multiple strategies."""
+    ni, nj = name_i.strip().lower(), name_j.strip().lower()
+    if fuzz.token_sort_ratio(ni, nj) >= 85:
+        return True
+    base_i = _normalize_show_for_dedup(name_i)
+    base_j = _normalize_show_for_dedup(name_j)
+    if base_i == base_j:
+        return True
+    if fuzz.token_sort_ratio(base_i, base_j) >= 85:
+        return True
+    shorter, longer = (base_i, base_j) if len(base_i) <= len(base_j) else (base_j, base_i)
+    if len(shorter) >= 3 and longer.startswith(shorter):
+        return True
+    return False
+
+
+def _preferred_show_title(title_i, title_j):
+    """Pick the preferred title when deduplicating two entries for the same show."""
+    clean_i = re.sub(r'\s*\([^)]*\)\s*', ' ', title_i).strip()
+    clean_j = re.sub(r'\s*\([^)]*\)\s*', ' ', title_j).strip()
+    if len(clean_j) > len(clean_i):
+        return title_j
+    if len(clean_i) > len(clean_j):
+        return title_i
+    if len(title_i) <= len(title_j):
+        return title_i
+    return title_j
+
+
 def match_and_dedup(df):
     """
     Post-scrape processing: match venues to registry and deduplicate across sources.
@@ -786,7 +826,7 @@ def match_and_dedup(df):
 
     # Deduplicate: same show (fuzzy) + same venue + overlapping dates
     keep = [True] * len(df)
-    show_norm = df['SHOW'].str.strip().str.lower().tolist()
+    title_overrides = {}
     venue_norm = df['CANONICAL_VENUE'].str.strip().str.lower().tolist()
     cities = df['CITY'].str.strip().str.lower().tolist()
     starts = pd.to_datetime(df['START_DATE'], format='%m/%d/%Y', errors='coerce')
@@ -812,7 +852,7 @@ def match_and_dedup(df):
             if not same_venue:
                 continue
 
-            if fuzz.token_sort_ratio(show_norm[i], show_norm[j]) < 85:
+            if not _shows_match(df.iloc[i]['SHOW'], df.iloc[j]['SHOW']):
                 continue
 
             # Date overlap check (with 3-day tolerance)
@@ -824,10 +864,24 @@ def match_and_dedup(df):
                 continue
 
             if s_i - tolerance <= e_j and s_j - tolerance <= e_i:
-                if df.iloc[j]['TICKETS'] and not df.iloc[i]['TICKETS']:
+                preferred = _preferred_show_title(df.iloc[i]['SHOW'], df.iloc[j]['SHOW'])
+                has_tickets_i = bool(df.iloc[i]['TICKETS'])
+                has_tickets_j = bool(df.iloc[j]['TICKETS'])
+                if has_tickets_j and not has_tickets_i:
                     keep[i] = False
-                else:
+                    title_overrides[j] = preferred
+                elif has_tickets_i and not has_tickets_j:
                     keep[j] = False
+                    title_overrides[i] = preferred
+                else:
+                    if preferred == df.iloc[j]['SHOW']:
+                        keep[i] = False
+                    else:
+                        keep[j] = False
+
+    for idx, title in title_overrides.items():
+        if keep[idx]:
+            df.iloc[idx, df.columns.get_loc('SHOW')] = title
 
     result = df[keep].reset_index(drop=True)
     dropped = len(df) - len(result)
