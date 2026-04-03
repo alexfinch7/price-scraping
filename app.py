@@ -11,6 +11,72 @@ from rapidfuzz import fuzz
 from scrape import scrape_pricing, get_broadway_shows
 from scrape_shows import get_tourstoyou_data, get_broadway_data, split_location, standardize_date_range
 
+SHOW_ID_MAP = {
+    "& Juliet": 1,
+    "Aladdin": 2,
+    "Chicago": 5,
+    "Hadestown": 6,
+    "Hamilton": 7,
+    "Harry Potter and the Cursed Child": 8,
+    "MJ": 12,
+    "Moulin Rouge! The Musical": 13,
+    "Oh, Mary!": 14,
+    "SIX": 16,
+    "The Book of Mormon": 19,
+    "The Great Gatsby": 20,
+    "The Lion King": 21,
+    "The Outsiders": 23,
+    "Wicked": 26,
+    "Maybe Happy Ending": 36,
+    "Death Becomes Her": 39,
+    "Stranger Things: The First Shadow": 49,
+    "Little Shop of Horrors": 68,
+    "The Play that Goes Wrong": 75,
+    "Buena Vista Social Club": 86,
+    "Operation Mincemeat: A New Musical": 87,
+    "Just in Time": 102,
+    "Ragtime": 137,
+    "Heathers: The Musical": 143,
+    "Chess": 155,
+    "Two Strangers (Carry a Cake Across New York)": 164,
+    "Dog Day Afternoon": 169,
+    "Schmigadoon!": 171,
+    "Giant": 172,
+    "Joe Turner's Come and Gone": 175,
+    "Every Brilliant Thing": 176,
+    "The 25th Annual Putnam County Spelling Bee": 180,
+    "The Lost Boys: A New Musical": 185,
+    "Titanique": 186,
+    "The Rocky Horror Show": 189,
+    "Beaches, A New Musical": 190,
+    "The Fear of 13": 193,
+    "CATS: The Jellicle Ball": 195,
+    "Arthur Miller's Death of a Salesman": 196,
+}
+
+_SHOW_ID_MAP_LOWER = {k.lower().strip(): v for k, v in SHOW_ID_MAP.items()}
+
+def get_show_event_id(show_title):
+    """Look up the group_ticket_event ID for a show title using exact, case-insensitive, then fuzzy matching."""
+    if not show_title:
+        return None
+    title = show_title.strip()
+    if title in SHOW_ID_MAP:
+        return SHOW_ID_MAP[title]
+    lower = title.lower()
+    if lower in _SHOW_ID_MAP_LOWER:
+        return _SHOW_ID_MAP_LOWER[lower]
+    best_score = 0
+    best_id = None
+    for name, id_val in SHOW_ID_MAP.items():
+        score = fuzz.token_sort_ratio(lower, name.lower())
+        if score > best_score:
+            best_score = score
+            best_id = id_val
+    if best_score >= 70:
+        return best_id
+    return None
+
 st.set_page_config(page_title="Broadway Scraper Suite", layout="wide")
 
 # Custom CSS for better styling
@@ -74,6 +140,14 @@ if "shows_df" not in st.session_state:
 if "shows_last_scraped" not in st.session_state:
     st.session_state.shows_last_scraped = None
 
+# Session state for Bulk Price Tier Helper
+if "bulk_results_df" not in st.session_state:
+    st.session_state.bulk_results_df = None
+if "bulk_last_run" not in st.session_state:
+    st.session_state.bulk_last_run = None
+if "bulk_is_running" not in st.session_state:
+    st.session_state.bulk_is_running = False
+
 # Supabase for touring cache
 from supabase import create_client
 
@@ -117,6 +191,40 @@ def load_cache_from_supabase():
                 return df, last_scraped
     except Exception as e:
         st.warning(f"Could not load cache: {e}")
+    return None, None
+
+def save_bulk_cache_to_supabase(df):
+    """Save bulk pricing tier results to Supabase."""
+    supabase = get_supabase()
+    records = json.loads(df.to_json(orient='records'))
+    cache_data = {
+        'rows': records,
+        'last_scraped': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    try:
+        supabase.table('bulk_pricing_cache').upsert({
+            'id': 1,
+            'data': cache_data,
+            'last_updated': datetime.now().isoformat()
+        }).execute()
+        return cache_data['last_scraped']
+    except Exception as e:
+        st.warning(f"Could not save bulk pricing cache: {e}")
+        return cache_data['last_scraped']
+
+def load_bulk_cache_from_supabase():
+    """Load bulk pricing tier results from Supabase."""
+    try:
+        supabase = get_supabase()
+        response = supabase.table('bulk_pricing_cache').select('data').eq('id', 1).execute()
+        if response.data and len(response.data) > 0:
+            cache_data = response.data[0]['data']
+            if cache_data and 'rows' in cache_data and cache_data['rows']:
+                df = pd.DataFrame(cache_data['rows'])
+                last_scraped = cache_data.get('last_scraped', 'Unknown')
+                return df, last_scraped
+    except Exception as e:
+        st.warning(f"Could not load bulk pricing cache: {e}")
     return None, None
 
 # Session state for tracking expanded result expanders
@@ -368,7 +476,7 @@ def transform_pricing_to_rows(scraped_data):
     
     return result
 
-def format_pricing_with_ai(transformed_data, scraped_data=None):
+def format_pricing_with_ai(transformed_data, scraped_data=None, show_title=None):
     """
     Use OpenAI to categorize section names into standard tiers, then compute
     per-date min/max price ranges from the raw scraped data.
@@ -400,6 +508,7 @@ Categorize each section name into exactly one of these tiers:
 - Orchestra
 - FrontMezzanine
 - RearMezzanine
+- Balcony
 
 Return a JSON object mapping each tier to the list of section names that belong to it.
 If a tier has no matching sections, set its value to null.
@@ -409,11 +518,14 @@ Example:
   "Premium": ["Premium"],
   "MidPremium": ["Mid Premium"],
   "Orchestra": ["Orchestra Rows AA-N", "Orchestra Center Rows L-N, Side Rows L-N"],
-  "FrontMezzanine": ["Mezzanine Rows A-D", "Mezzanine Center Rows A-D"],
-  "RearMezzanine": ["Mezzanine Rows G-K", "Mezzanine Rows H-K"]
+  "FrontMezzanine": ["Mezzanine Rows A-D"],
+  "RearMezzanine": ["Mezzanine Rows G-K", "Mezzanine Rows H-K"],
+  "Balcony": ["Balcony"]
 }}
 
 NOTE: Mid Premium and Premium are separate tiers. Sometimes there will not be a mid premium tier - in that case set the MidPremium value to null.
+
+IMPORTANT: The front vs rear mezzanine tiers are separate and can change based on the show, but you should use the rows to distinguish between them. If there is only 1 mezzanine tier, set the RearMezzanine value to null.
 
 Return ONLY the JSON, no other text."""
 
@@ -421,7 +533,7 @@ Return ONLY the JSON, no other text."""
         client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.4",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
@@ -451,7 +563,7 @@ Return ONLY the JSON, no other text."""
                 date_groups[dt] = []
             date_groups[dt].append(item)
 
-        tier_order = ["Premium", "MidPremium", "Orchestra", "FrontMezzanine", "RearMezzanine"]
+        tier_order = ["Premium", "MidPremium", "Orchestra", "FrontMezzanine", "RearMezzanine", "Balcony"]
 
         result_rows = []
         for date_time, items in date_groups.items():
@@ -528,6 +640,15 @@ Return ONLY the JSON, no other text."""
         result_rows.sort(key=lambda r: (parse_event_date(r), r.get('time', '')))
 
         result_df = pd.DataFrame(result_rows)
+
+        event_id = get_show_event_id(show_title)
+        result_df.insert(0, "group_ticket_event", event_id)
+
+        result_df["reg_tier_7"] = ""
+        result_df["reg_tier_8"] = ""
+
+        for i in range(1, 9):
+            result_df[f"school_tier_{i}"] = result_df[f"reg_tier_{i}"]
 
         return result_df, tier_mapping, None
 
@@ -651,18 +772,19 @@ def format_pricing_by_date(scraped_data, show_title=None):
 
 def run_scraping_task(task):
     """Run a single scraping task"""
+    task_snapshot = dict(task)
     try:
         to_date = task["to_date"] if task["to_date"] else task["from_date"]
         result = scrape_pricing(task["url"], task["from_date"], to_date)
         return {
-            "task": task,
+            "task": task_snapshot,
             "result": result,
             "success": True,
             "timestamp": datetime.now().strftime("%H:%M:%S")
         }
     except Exception as e:
         return {
-            "task": task,
+            "task": task_snapshot,
             "result": {"error": str(e), "scrapedData": [], "clickSuccessful": False},
             "success": False,
             "timestamp": datetime.now().strftime("%H:%M:%S")
@@ -1203,7 +1325,7 @@ if st.session_state.page == "pricing":
                         
                         if format_clicked:
                             with st.spinner("Processing with AI..."):
-                                result_df, pricing_tiers, error = format_pricing_with_ai(transformed_data, scraped_data)
+                                result_df, pricing_tiers, error = format_pricing_with_ai(transformed_data, scraped_data, show_title=task.get('show_title'))
                                 if error:
                                     st.error(error)
                                 else:
@@ -1244,15 +1366,22 @@ if st.session_state.page == "pricing":
     if st.button("🎭 Go to Touring Production Search", use_container_width=True):
         st.session_state.page = "touring"
         st.rerun()
+    if st.button("📊 Bulk Price Tier Helper", use_container_width=True):
+        st.session_state.page = "bulk_pricing"
+        st.rerun()
 
 elif st.session_state.page == "touring":
     # ------------------------------------------------------------------
     # Touring Search UI
     # ------------------------------------------------------------------
-    col_back, _ = st.columns([1, 4])
+    col_back, col_refresh_top, _ = st.columns([1, 1, 3])
     with col_back:
         if st.button("← Back"):
             st.session_state.page = "pricing"
+            st.rerun()
+    with col_refresh_top:
+        if st.button("🔄 Refresh", use_container_width=True, key="tour_refresh_top"):
+            asyncio.run(scrape_all_touring())
             st.rerun()
 
     st.title("Touring Production Search")
@@ -1299,24 +1428,187 @@ elif st.session_state.page == "touring":
     else:
         df = st.session_state.shows_df.copy() # Work on a copy
         
-        # Filter/Search + Refresh button
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            search_term = st.text_input("Search shows, cities, venues...")
-        with col2:
-            st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)  # Align with input
-            if st.button("Refresh", use_container_width=True):
-                asyncio.run(scrape_all_touring())
-                st.rerun()
-        
+        # Filter controls
+        FILTER_FIELDS = {
+            "Keyword": None,
+            "City": "CITY",
+            "State": "STATE",
+            "Show Name": "SHOW",
+            "Venue Name": "CANONICAL_VENUE",
+            "Address": "ADDRESS",
+            "Start Date": "START_DATE",
+            "End Date": "END_DATE",
+            "Date Range": "__DATE_RANGE__",
+        }
+        FILTER_FIELD_LIST = list(FILTER_FIELDS.keys())
+        FILTER_OPS = ["=", "!=", "<", ">", "<=", ">="]
+        FILTER_COMBINATORS = ["None", "AND", "OR"]
+
+        if "tour_filter_next_id" not in st.session_state:
+            st.session_state.tour_filter_next_id = 1
+        if "tour_filter_ids" not in st.session_state or not st.session_state.tour_filter_ids:
+            st.session_state.tour_filter_ids = [0]
+
+        def _build_single_mask(df, field_name, op, val):
+            """Build a boolean mask for one filter condition."""
+            col_name = FILTER_FIELDS[field_name]
+            is_date = field_name in ("Start Date", "End Date")
+
+            if field_name == "Keyword":
+                if op == "!=":
+                    return ~df.astype(str).apply(lambda x: x.str.contains(val, case=False)).any(axis=1)
+                return df.astype(str).apply(lambda x: x.str.contains(val, case=False)).any(axis=1)
+
+            if field_name == "Date Range":
+                start_dates = pd.to_datetime(df["START_DATE"], format="%m/%d/%Y", errors="coerce")
+                end_dates = pd.to_datetime(df["END_DATE"], format="%m/%d/%Y", errors="coerce")
+                day_counts = (end_dates - start_dates).dt.days
+                try:
+                    target = float(val)
+                except Exception:
+                    return pd.Series(True, index=df.index)
+                ops = {"=": "eq", "!=": "ne", "<": "lt", ">": "gt", "<=": "le", ">=": "ge"}
+                return getattr(day_counts, ops.get(op, "eq"))(target)
+
+            if is_date:
+                col_dates = pd.to_datetime(df[col_name], format="%m/%d/%Y", errors="coerce")
+                try:
+                    target = pd.to_datetime(val)
+                except Exception:
+                    return pd.Series(True, index=df.index)
+                ops = {"=": "eq", "!=": "ne", "<": "lt", ">": "gt", "<=": "le", ">=": "ge"}
+                return getattr(col_dates, ops.get(op, "eq"))(target)
+
+            col_str = df[col_name].astype(str).str.strip().str.lower()
+            val_lower = val.lower()
+            if op == "=":
+                return col_str.str.contains(val_lower, case=False, na=False)
+            if op == "!=":
+                return ~col_str.str.contains(val_lower, case=False, na=False)
+            ops = {"<": "lt", ">": "gt", "<=": "le", ">=": "ge"}
+            return getattr(col_str, ops.get(op, "eq"))(val_lower)
+
+        # Render filter rows dynamically with removable rows
+        filter_rows = []
+        remove_row_id = None
+        for row_idx, row_id in enumerate(st.session_state.tour_filter_ids):
+            is_first = row_idx == 0
+            col_field, col_op, col_value, col_combo, col_remove = st.columns([2, 1.5, 3.0, 1, 1.1])
+            with col_field:
+                field = st.selectbox(
+                    "Field" if is_first else "Field",
+                    FILTER_FIELD_LIST,
+                    index=0,
+                    key=f"tf_field_{row_id}",
+                    label_visibility="visible" if is_first else "collapsed",
+                )
+            with col_op:
+                op = st.selectbox(
+                    "Operator" if is_first else "Op",
+                    FILTER_OPS,
+                    index=0,
+                    key=f"tf_op_{row_id}",
+                    label_visibility="visible" if is_first else "collapsed",
+                )
+            with col_value:
+                val = st.text_input(
+                    "Value" if is_first else "Val",
+                    key=f"tf_val_{row_id}",
+                    label_visibility="visible" if is_first else "collapsed",
+                )
+            with col_combo:
+                combo = st.selectbox(
+                    "Then" if is_first else "Then",
+                    FILTER_COMBINATORS,
+                    index=0,
+                    key=f"tf_combo_{row_id}",
+                    label_visibility="visible" if is_first else "collapsed",
+                )
+            with col_remove:
+                remove_action = st.selectbox(
+                    "Row" if is_first else "Row",
+                    ["Active", "Remove"],
+                    index=0,
+                    key=f"tf_remove_{row_id}",
+                    label_visibility="visible" if is_first else "collapsed",
+                    disabled=len(st.session_state.tour_filter_ids) == 1,
+                )
+                if remove_action == "Remove":
+                    remove_row_id = row_id
+
+            filter_rows.append({"id": row_id, "field": field, "op": op, "value": val.strip(), "combo": combo})
+
+        if remove_row_id is not None:
+            st.session_state.tour_filter_ids = [rid for rid in st.session_state.tour_filter_ids if rid != remove_row_id]
+            for prefix in ("tf_field_", "tf_op_", "tf_val_", "tf_combo_", "tf_remove_"):
+                key = f"{prefix}{remove_row_id}"
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+
+        # If the last row asks for AND/OR, append a new blank row
+        if filter_rows and filter_rows[-1]["combo"] != "None":
+            new_id = st.session_state.tour_filter_next_id
+            st.session_state.tour_filter_next_id += 1
+            st.session_state.tour_filter_ids.append(new_id)
+            st.rerun()
+
         if st.session_state.shows_last_scraped:
             st.caption(f"Last updated: {st.session_state.shows_last_scraped}")
-        if search_term:
-            # Create a mask for filtering
-            mask = df.astype(str).apply(lambda x: x.str.contains(search_term, case=False)).any(axis=1)
-            display_df = df[mask].reset_index(drop=True)
+
+        # Apply chained filters
+        active_filters = [r for r in filter_rows if r["value"]]
+        if active_filters:
+            combined_mask = _build_single_mask(df, active_filters[0]["field"], active_filters[0]["op"], active_filters[0]["value"])
+            for i in range(1, len(active_filters)):
+                prev_combo = active_filters[i - 1]["combo"]
+                new_mask = _build_single_mask(df, active_filters[i]["field"], active_filters[i]["op"], active_filters[i]["value"])
+                if prev_combo == "OR":
+                    combined_mask = combined_mask | new_mask
+                else:
+                    combined_mask = combined_mask & new_mask
+            display_df = df[combined_mask].reset_index(drop=True)
         else:
             display_df = df.reset_index(drop=True)
+
+        # Filters that should additionally affect the final venue printout.
+        # Per user rules:
+        # - Always apply Start Date / End Date / Date Range filters
+        # - Apply Keyword / Show Name only when operator is "!="
+        def _should_apply_to_print(filter_row):
+            field = filter_row["field"]
+            op = filter_row["op"]
+            if field in ("Start Date", "End Date", "Date Range"):
+                return True
+            if field in ("Keyword", "Show Name") and op == "!=":
+                return True
+            return False
+
+        print_filters = [r for r in active_filters if _should_apply_to_print(r)]
+
+        def _apply_filters_for_print(source_df, filters_to_apply):
+            """Apply selected filter chain to source_df for venue schedule output."""
+            if not filters_to_apply:
+                return source_df
+            print_mask = _build_single_mask(
+                source_df,
+                filters_to_apply[0]["field"],
+                filters_to_apply[0]["op"],
+                filters_to_apply[0]["value"],
+            )
+            for i in range(1, len(filters_to_apply)):
+                combo = filters_to_apply[i - 1]["combo"]
+                next_mask = _build_single_mask(
+                    source_df,
+                    filters_to_apply[i]["field"],
+                    filters_to_apply[i]["op"],
+                    filters_to_apply[i]["value"],
+                )
+                if combo == "OR":
+                    print_mask = print_mask | next_mask
+                else:
+                    print_mask = print_mask & next_mask
+            return source_df[print_mask].copy()
             
         st.markdown("### Scraped Shows")
         st.caption("Select rows to generate venue schedule text.")
@@ -1367,6 +1659,12 @@ elif st.session_state.page == "touring":
                         & (df['CITY'].astype(str).str.strip() == sv['city'])
                     ].copy()
 
+                # Apply print-stage filters so selectively excluded shows
+                # do not appear in the final venue text output.
+                venue_shows = _apply_filters_for_print(venue_shows, print_filters)
+                if venue_shows.empty:
+                    continue
+
                 venue_shows['_sort_date'] = pd.to_datetime(
                     venue_shows['START_DATE'], format='%m/%d/%Y', errors='coerce'
                 )
@@ -1394,3 +1692,156 @@ elif st.session_state.page == "touring":
 
             final_text = "\n\n".join(all_venue_texts)
             st.text_area("Copy Text", final_text, height=250)
+
+elif st.session_state.page == "bulk_pricing":
+    # ------------------------------------------------------------------
+    # Bulk Price Tier Helper UI
+    # ------------------------------------------------------------------
+    col_back, col_refresh, _ = st.columns([1, 1, 3])
+    with col_back:
+        if st.button("← Back"):
+            st.session_state.page = "pricing"
+            st.rerun()
+    with col_refresh:
+        refresh_clicked = st.button("🔄 Refresh", use_container_width=True, key="bulk_refresh_top")
+
+    st.title("📊 Bulk Price Tier Helper")
+    st.markdown("Scrape price tiers for **every Broadway show** from tomorrow through each show's end date, then process them all into standardised tier columns.")
+
+    # Load from Supabase if no bulk data in session
+    if st.session_state.bulk_results_df is None:
+        with st.spinner("Loading cached bulk pricing data..."):
+            cached_bulk_df, last_bulk_scraped = load_bulk_cache_from_supabase()
+        if cached_bulk_df is not None:
+            st.session_state.bulk_results_df = cached_bulk_df
+            st.session_state.bulk_last_run = last_bulk_scraped
+
+    # Ensure shows are loaded
+    if not st.session_state.shows_loaded:
+        with st.spinner("Loading Broadway shows..."):
+            try:
+                shows, _ = get_broadway_shows()
+                st.session_state.broadway_shows = shows
+                st.session_state.shows_loaded = True
+            except Exception as e:
+                st.error(f"Failed to load shows: {e}")
+
+    if not st.session_state.broadway_shows:
+        st.warning("No Broadway shows available. Go back and load shows first.")
+    else:
+        shows = st.session_state.broadway_shows
+        tomorrow = (datetime.now() + pd.Timedelta(days=1)).strftime("%m/%d/%Y")
+
+        # Build a preview table of what will be scraped
+        preview_rows = []
+        for show in shows:
+            end_date = show.get("onSaleThrough", "")
+            event_id = get_show_event_id(show["title"])
+            preview_rows.append({
+                "ID": event_id if event_id is not None else "—",
+                "Show": show["title"],
+                "From": tomorrow,
+                "To": end_date if end_date else "—",
+            })
+        preview_df = pd.DataFrame(preview_rows)
+
+        if st.session_state.bulk_last_run:
+            st.caption(f"Last run: {st.session_state.bulk_last_run}")
+        else:
+            st.caption(f"{len(shows)} shows will be scraped")
+
+        with st.expander("Shows to scrape", expanded=False):
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+        # ----- Run bulk scrape -----
+        if refresh_clicked:
+            st.session_state.bulk_is_running = True
+
+        if st.session_state.bulk_is_running:
+            all_tier_dfs = []
+            errors = []
+
+            progress = st.progress(0)
+            status_text = st.empty()
+            completed = 0
+
+            def _bulk_scrape_single(show):
+                """Scrape + tier-process a single show. Returns (show_title, df, error)."""
+                title = show["title"]
+                url = show["url"]
+                end_date = show.get("onSaleThrough", "")
+                from_date = (datetime.now() + pd.Timedelta(days=1)).strftime("%m/%d/%Y")
+                if not end_date:
+                    end_date = from_date
+
+                try:
+                    raw = scrape_pricing(url, from_date, end_date)
+                    scraped = raw.get("scrapedData", [])
+                    if not scraped:
+                        return title, None, raw.get("error") or "No data returned"
+                    transformed = transform_pricing_to_rows(scraped)
+                    tier_df, _, tier_err = format_pricing_with_ai(transformed, scraped, show_title=title)
+                    if tier_err:
+                        return title, None, tier_err
+                    tier_df.insert(1, "show_title", title)
+                    return title, tier_df, None
+                except Exception as exc:
+                    return title, None, str(exc)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                future_map = {executor.submit(_bulk_scrape_single, s): s for s in shows}
+                for future in concurrent.futures.as_completed(future_map):
+                    title, df, err = future.result()
+                    completed += 1
+                    progress.progress(completed / len(shows))
+                    status_text.text(f"Completed {completed}/{len(shows)} — {title}")
+                    if df is not None:
+                        all_tier_dfs.append(df)
+                    if err:
+                        errors.append(f"{title}: {err}")
+
+            progress.empty()
+            status_text.empty()
+
+            if all_tier_dfs:
+                combined = pd.concat(all_tier_dfs, ignore_index=True)
+                st.session_state.bulk_results_df = combined
+                st.session_state.bulk_last_run = save_bulk_cache_to_supabase(combined)
+            else:
+                st.session_state.bulk_results_df = None
+                st.session_state.bulk_last_run = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state.bulk_is_running = False
+
+            if errors:
+                with st.expander(f"⚠️ {len(errors)} show(s) had errors", expanded=False):
+                    for e in errors:
+                        st.text(e)
+
+            st.rerun()
+
+        # ----- Display results -----
+        if st.session_state.bulk_results_df is not None:
+            df = st.session_state.bulk_results_df
+            st.markdown(f"### Results — {len(df)} rows across {df['show_title'].nunique()} shows")
+
+            search = st.text_input("Filter by show name...", key="bulk_search")
+            if search:
+                mask = df["show_title"].str.contains(search, case=False, na=False)
+                display = df[mask].reset_index(drop=True)
+            else:
+                display = df
+
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            col_dl, _ = st.columns([1, 3])
+            with col_dl:
+                csv_data = df.to_csv(index=False)
+                st.download_button(
+                    "📥 Download CSV",
+                    data=csv_data,
+                    file_name=f"bulk_price_tiers_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+        elif st.session_state.bulk_last_run:
+            st.info("No tier data was returned in the last run. Check errors above.")
